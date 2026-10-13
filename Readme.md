@@ -8,8 +8,6 @@ The objective of the WaterWise Data Extraction Stage is to extract the required 
 
 > The goal of this stage is to extract data from an identified source system and prepare a documented, traceable, and validated dataset for the next stage of the data pipeline.
 
-> **Traceability to Lab 2 (checked, not modified):** This Stage 1 elaborates the `WaterWise Operational and Analytical Batch Data Pipeline` — same source (`Existing WaterWise Supabase/PostgreSQL`), same `Python ingest → PostgreSQL SQL transform → Apache Airflow orchestration`, same `Daily batch`. Stage 1 covers Lab 2 lineage steps Ingestion + Data Validation only; Cleaning, Transformation, and Storage remain downstream stages.
-
 ---
 
 ## 1. Data Source and Extraction Specification
