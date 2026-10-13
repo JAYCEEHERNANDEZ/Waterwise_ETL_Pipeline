@@ -8,6 +8,8 @@ The objective of the WaterWise Data Extraction Stage is to extract the required 
 
 > The goal of this stage is to extract data from an identified source system and prepare a documented, traceable, and validated dataset for the next stage of the data pipeline.
 
+> **Traceability to Lab 2 (checked, not modified):** This Stage 1 elaborates the `WaterWise Operational and Analytical Batch Data Pipeline` — same source (`Existing WaterWise Supabase/PostgreSQL`), same `Python ingest → PostgreSQL SQL transform → Apache Airflow orchestration`, same `Daily batch`. Stage 1 covers Lab 2 lineage steps Ingestion + Data Validation only; Cleaning, Transformation, and Storage remain downstream stages.
+
 ---
 
 ## 1. Data Source and Extraction Specification
@@ -72,6 +74,8 @@ The extraction will focus on the operational records necessary for WaterWise's a
 | Consumption | `id, consumer_id, reading_date, previous_reading, present_reading, consumption, timestamps` | Analyze water consumption |
 | Billing | `id, consumption_id, user_id, billing_date, due_date, total_bill, timestamps` | Monitor billing and account balances |
 | Payments | `id, billing_id, total_paid, amount_tendered, remaining_balance, payment_date, payment_method, timestamps` | Monitor collections and payment transactions |
+
+> **Out of scope for Stage 1 (per Lab 2 schema, deferred to later stages):** `admins`, `meter_readers`, `notifications`, `notification_reads`, `consumer_push_subscriptions`, `notification_push_jobs`, `events`, `generated_reports`, `ai_consumption_cache`, `admin_trusted_devices`, `password_reset_request_limits`, `system_settings`, and session/audit tables. Stage 1 extracts only the 4 operational tables above.
 
 ### 1.6 Source Limitations and Assumptions
 
@@ -328,11 +332,12 @@ Each rule defines: validation condition, acceptance criteria, pipeline action, a
 
 ### 7.3 Handover
 
-What is passed to the next stage (Transformation):
+What is passed to the next stage — Transformation (`PostgreSQL SQL` per Lab 2) → Storage (`Existing Supabase/PostgreSQL`) → consumption via dashboard, analytics, PDF reports, demand forecasting, and administrative recommendations:
 
 - Staged raw datasets: `rawdata/consumers|consumption|billing|payments/<run_date>/` with agreed file format (e.g. Parquet/CSV + schema file).
 - Extraction metadata per §4 (run ID, window, counts, duration).
 - Validation results per §3 (per-table PASS/WARNING/FAIL + rejected-row quarantine location).
+- Processing-period and grouping config carried forward per Lab 2: selected monthly or yearly period, overall or purok-level grouping.
 - Example handover summary:
 
 | Validation Summary | Result |
