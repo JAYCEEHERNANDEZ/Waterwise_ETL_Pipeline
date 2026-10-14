@@ -26,10 +26,10 @@ The objective of the WaterWise Data Extraction Stage is to extract the required 
 
 | Item | Description |
 | --- | --- |
-| **Extraction tool** | Python (`supabase-py` / `psycopg2`) |
+| **Extraction tool** | Python|
 | **Orchestration tool** | Apache Airflow |
 | **Extraction type** | Scheduled batch extraction |
-| **Extraction mode** | Incremental extraction (with initial full load) |
+| **Extraction mode** | Incremental extraction |
 
 The extraction process follows this sequence:
 
