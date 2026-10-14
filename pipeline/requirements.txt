@@ -1,0 +1,6 @@
+# WaterWise Stage 1 runtime deps (Python 3.10+)
+psycopg2-binary>=2.9
+pandas>=2.0
+python-dotenv>=1.0
+# Airflow is only needed on the orchestrator, not for local `python -m pipeline.stage` runs:
+# apache-airflow>=2.8

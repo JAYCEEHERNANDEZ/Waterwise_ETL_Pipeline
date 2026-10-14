@@ -1,0 +1,1 @@
+id,billing_id,total_paid,amount_tendered,change_given,remaining_balance,payment_date,payment_method,reference_number,idempotency_key,created_at,updated_at

@@ -1,0 +1,15 @@
+{
+  "pipeline_run_id": "ww-extract-2026-10-14-1205-dfb597",
+  "table_name": "consumption",
+  "extraction_started_at": "2026-10-14T12:05:43.683658+00:00",
+  "extraction_window_start": "2026-10-14T12:04:08.650790+00:00",
+  "extraction_window_end": "2026-10-14T12:05:39.208740+00:00",
+  "extraction_status": "SUCCESS",
+  "records_read": 0,
+  "records_extracted": 0,
+  "records_rejected": 0,
+  "validation_result": "PASS",
+  "error_message": null,
+  "extraction_ended_at": "2026-10-14T12:05:44.294750+00:00",
+  "extraction_duration_ms": 610
+}
