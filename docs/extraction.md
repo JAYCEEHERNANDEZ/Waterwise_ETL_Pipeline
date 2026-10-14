@@ -196,7 +196,7 @@ For each validation check: check name, target, purpose, and measurable pass/fail
 | Check Name | Target | Purpose | Validation Criteria (Pass / Fail) |
 | --- | --- | --- | --- |
 | Source connection and accessibility | Supabase/PostgreSQL connection | Confirm the source is reachable before extraction | PASS: connection succeeds within timeout; FAIL: connection error → stop run, log error |
-| Required tables and columns exist | `consumers`, `consumption`, `billing`, `payments` + columns in Section 2 | Detect schema drift early | PASS: all required tables/columns present; FAIL: any missing → stop run |
+| Required tables and columns exist | `consumers`, `consumption`, `billing`, `payments`| Detect schema drift early | PASS: all required tables/columns present; FAIL: any missing → stop run |
 | Required identifiers present | `consumers.id`, `consumption.id + consumer_id + reading_date`, `billing.id + consumption_id + user_id`, `payments.id + billing_id` | Ensure join keys exist | PASS: 0 rows with NULL identifiers; FAIL: >0 → quarantine affected rows |
 | Primary key uniqueness | PK of each extracted table | Detect duplicates in extract | PASS: 0 duplicate PKs; FAIL: >0 → fail table validation |
 | Record count and extraction completeness | Row counts per table vs. source `COUNT(*)` in window | Verify no rows lost | PASS: `extracted == source count` in window; WARNING if count differs by >0 but <1%; FAIL if mismatch beyond tolerance or 0 rows when source >0 |
