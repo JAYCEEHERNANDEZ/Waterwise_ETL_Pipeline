@@ -6,7 +6,6 @@
 
 The objective of the WaterWise Data Extraction Stage is to extract the required operational data from the existing WaterWise Supabase/PostgreSQL database and prepare a documented, traceable, and validated dataset for the succeeding Data Validation and Transformation stages.
 
-
 ---
 
 ## 1. Data Source and Extraction Specification
@@ -25,7 +24,7 @@ The objective of the WaterWise Data Extraction Stage is to extract the required 
 
 | Item | Description |
 | --- | --- |
-| **Extraction tool** | Python|
+| **Extraction tool** | Python |
 | **Orchestration tool** | Apache Airflow |
 | **Extraction type** | Scheduled batch extraction |
 | **Extraction mode** | Incremental extraction |
@@ -36,7 +35,7 @@ The extraction process follows this sequence:
 2. Python makes the connection to the WaterWise Supabase/PostgreSQL database.
 3. Python fetches the desired records from the chosen tables.
 4. The records extracted are placed in the rawdata staging.
-5. Validation of the data conducted at the extraction level.
+5. Validation of the data is conducted at the extraction level.
 6. Data from the pipeline stage is validated and passed to the next pipeline stage.
 
 ### 1.3 Incremental Extraction Window
@@ -57,7 +56,7 @@ Initial load is a full extraction. Succeeding runs are incremental using the sto
 | Item | Value |
 | --- | --- |
 | Frequency | Daily scheduled batch |
-| Airflow DAG | waterwise_daily_extraction |
+| Airflow DAG | `waterwise_daily_extraction` |
 | Scheduled time | Once daily (off-peak, e.g. 01:00 Asia/Manila) |
 | Retry | Up to 3 retries with backoff on connection/query failure |
 
@@ -72,10 +71,9 @@ The extraction will focus on the operational records necessary for WaterWise's a
 | Billing | `id, consumption_id, user_id, billing_date, due_date, total_bill, timestamps` | Monitor billing and account balances |
 | Payments | `id, billing_id, total_paid, amount_tendered, remaining_balance, payment_date, payment_method, timestamps` | Monitor collections and payment transactions |
 
-
 ### 1.6 Source Limitations and Assumptions
 
-Limitations:
+**Limitations:**
 
 - The extraction depends on the availability of the Supabase/PostgreSQL database.
 - Database credentials and network connectivity must be available.
@@ -83,7 +81,7 @@ Limitations:
 - Missing or incomplete historical records may affect analytical results.
 - Temporary database or network failures may interrupt extraction.
 
-Assumptions:
+**Assumptions:**
 
 - Service-role credentials used by the extraction job are kept server-side and never exposed to the frontend.
 - Schema reference: `backend/db/migration.sql` and `backend/db/full_setup_migration.sql`.
@@ -124,6 +122,7 @@ Assumptions:
 | `updated_at` | `TIMESTAMPTZ` | — | Last update timestamp |
 
 **Relationships:** Referenced by `consumption.consumer_id`, `billing.user_id`.
+
 **Reason for inclusion:** Consumer identity and location (`purok_no`, `status`) are required dimensions for per-purok and per-resident analytics.
 
 ### 2.3 Consumption Table
@@ -143,6 +142,7 @@ Assumptions:
 | `updated_at` | `TIMESTAMPTZ` | — | Last update timestamp |
 
 **Relationships:** Child of `consumers`; parent of `billing` via `billing.consumption_id`. One row per consumer per month enforced by unique index.
+
 **Reason for inclusion:** Core fact for consumption prediction, anomaly detection, and billing computation.
 
 ### 2.4 Billing Table
@@ -163,6 +163,7 @@ Assumptions:
 | `updated_at` | `TIMESTAMPTZ` | — | Last update timestamp |
 
 **Relationships:** Child of `consumption` and `consumers`; parent of `payments` via `payments.billing_id`.
+
 **Reason for inclusion:** Required for billing history, balances, flagged-account (≥3 outstanding bills), and collection analytics.
 
 ### 2.5 Payments Table
@@ -183,6 +184,7 @@ Assumptions:
 | `created_at` | `TIMESTAMPTZ` | — | Record creation timestamp |
 
 **Relationships:** Child of `billing`.
+
 **Reason for inclusion:** Required for collection monitoring, oldest-first payment order validation, and revenue reporting.
 
 ---
@@ -194,13 +196,13 @@ For each validation check: check name, target, purpose, and measurable pass/fail
 | Check Name | Target | Purpose | Validation Criteria (Pass / Fail) |
 | --- | --- | --- | --- |
 | Source connection and accessibility | Supabase/PostgreSQL connection | Confirm the source is reachable before extraction | PASS: connection succeeds within timeout; FAIL: connection error → stop run, log error |
-| Required tables and columns exist | `consumers`, `consumption`, `billing`, `payments` + columns in 2 | Detect schema drift early | PASS: all required tables/columns present; FAIL: any missing → stop run |
+| Required tables and columns exist | `consumers`, `consumption`, `billing`, `payments` + columns in Section 2 | Detect schema drift early | PASS: all required tables/columns present; FAIL: any missing → stop run |
 | Required identifiers present | `consumers.id`, `consumption.id + consumer_id + reading_date`, `billing.id + consumption_id + user_id`, `payments.id + billing_id` | Ensure join keys exist | PASS: 0 rows with NULL identifiers; FAIL: >0 → quarantine affected rows |
 | Primary key uniqueness | PK of each extracted table | Detect duplicates in extract | PASS: 0 duplicate PKs; FAIL: >0 → fail table validation |
 | Record count and extraction completeness | Row counts per table vs. source `COUNT(*)` in window | Verify no rows lost | PASS: `extracted == source count` in window; WARNING if count differs by >0 but <1%; FAIL if mismatch beyond tolerance or 0 rows when source >0 |
 | Referential completeness | `consumption.consumer_id`, `billing.consumption_id/user_id`, `payments.billing_id` | Ensure no orphaned facts | PASS: 0 orphans; FAIL: >0 orphans → quarantine |
 | Range sanity (extraction-level only) | `present_reading >= previous_reading`, `consumption >= 0`, `total_bill >= 0` | Catch obviously corrupt extracts | PASS: 0 violations; WARNING: violations present but passed through with flag for Transformation |
-| Data extraction errors or interruptions | Airflow task / Python job | Trace partial extracts | PASS: task success, no exception; FAIL: exception/timeout → retry per |
+| Data extraction errors or interruptions | Airflow task / Python job | Trace partial extracts | PASS: task success, no exception; FAIL: exception/timeout → retry per configured policy |
 
 ---
 
@@ -220,7 +222,7 @@ Each extraction run records the following fields for monitoring, troubleshooting
 | `records_rejected` | Number of records rejected/quarantined | `3` |
 | `extraction_window_start` | Start of incremental window | `2026-03-09T01:00:00+08:00` |
 | `extraction_window_end` | End of incremental window | `2026-03-10T01:00:00+08:00` |
-| `validation_result` | Summary of §3 checks | `PASS` / `WARNING: range-check 2 rows flagged` / `FAIL: PK duplicates` |
+| `validation_result` | Summary of Section 3 checks | `PASS` / `WARNING: range-check 2 rows flagged` / `FAIL: PK duplicates` |
 | `error_message` / `error_code` | Error detail if applicable | `None` / `CONN_TIMEOUT: Supabase unreachable after 3 retries` |
 | `extraction_duration_ms` | Wall-clock duration | `272000` |
 
@@ -244,12 +246,12 @@ Example log record (JSON):
 }
 ```
 
-Usage:
+**Usage:**
 
 - **Monitoring:** Airflow dashboard + run status per table.
-- **Troubleshooting:** window + counts + error code pinpoint missing/duplicate data.
-- **Auditing:** run ID + validation result prove what was extracted when.
-- **Recovery:** window + `records_read` vs. `records_extracted` determine safe re-run range without double-loading (aided by `idempotency_key`).
+- **Troubleshooting:** Window + counts + error code pinpoint missing/duplicate data.
+- **Auditing:** Run ID + validation result prove what was extracted when.
+- **Recovery:** Window + `records_read` vs. `records_extracted` determine safe re-run range without double-loading (aided by `idempotency_key`).
 
 ---
 
@@ -271,9 +273,9 @@ Usage:
 
 Expected table and column names, data types, required identifiers and constraints:
 
-- Tables: `consumers`, `consumption`, `billing`, `payments` as specified in 2.
+- Tables: `consumers`, `consumption`, `billing`, `payments` as specified in Section 2.
 - Required identifiers: `consumers.id`, `consumption.(id, consumer_id, reading_date)`, `billing.(id, consumption_id, user_id)`, `payments.(id, billing_id)` — all NOT NULL in the extract.
-- Constraints preserved in contract: PK uniqueness per table; FK references listed in §2; `consumption` one-row-per-consumer-per-month.
+- Constraints preserved in contract: PK uniqueness per table; FK references listed in Section 2; `consumption` one-row-per-consumer-per-month.
 
 ### 6.2 Naming Convention
 
@@ -286,7 +288,7 @@ Expected table and column names, data types, required identifiers and constraint
 Unexpected changes to column names, data types, or required fields are handled as follows:
 
 1. The `required tables and columns exist` check fails the run before staging write.
-2. The pipeline stops/quarantines per 7; no silent coercion.
+2. The pipeline stops/quarantines per Section 7; no silent coercion.
 3. A schema-change ticket is raised; the contract is versioned and the extractor mapping updated.
 4. Backfill/re-run uses the stored extraction window after the fix.
 
@@ -324,17 +326,18 @@ Each rule defines: validation condition, acceptance criteria, pipeline action, a
 
 - **Automatic Approval:** All critical validation checks pass (connection OK, schema OK, 0 NULL identifiers, 0 PK duplicates, counts match, 0 orphans). Pipeline promotes staged `rawdata` + metadata + validation results automatically.
 - **Manual Review:** Non-critical warnings (e.g. minor count variance within tolerance, range-sanity flags for Transformation to clean). Responsible: **data engineer / Super Admin**. Action: hold promotion until reviewed and explicitly released.
-- **Rejection or Failure:** Any critical FAIL (connection loss after retries, missing table/column, PK duplicates, orphan FKs, zero-extract when source non-zero). Pipeline retries transient failures (up to 3×), otherwise quarantines the affected table extract and stops promotion. Responsible: **data engineer** investigates via 4 logs and re-triggers the window.
+- **Rejection or Failure:** Any critical FAIL (connection loss after retries, missing table/column, PK duplicates, orphan FKs, zero-extract when source non-zero). Pipeline retries transient failures (up to 3×), otherwise quarantines the affected table extract and stops promotion. Responsible: **data engineer** investigates via Section 4 logs and re-triggers the window.
 
 ### 7.3 Handover
 
 What is passed to the next stage — Transformation (`PostgreSQL SQL` per Lab 2) → Storage (`Existing Supabase/PostgreSQL`) → consumption via dashboard, analytics, PDF reports, demand forecasting, and administrative recommendations:
 
 - Staged raw datasets: `rawdata/consumers|consumption|billing|payments/<run_date>/` with agreed file format (e.g. Parquet/CSV + schema file).
-- Extraction metadata per 4 (run ID, window, counts, duration).
-- Validation results per 3 (per-table PASS/WARNING/FAIL + rejected-row quarantine location).
+- Extraction metadata per Section 4 (run ID, window, counts, duration).
+- Validation results per Section 3 (per-table PASS/WARNING/FAIL + rejected-row quarantine location).
 - Processing-period and grouping config carried forward per Lab 2: selected monthly or yearly period, overall or purok-level grouping.
-- Example handover summary:
+
+**Example handover summary:**
 
 | Validation Summary | Result |
 | --- | --- |
@@ -353,7 +356,7 @@ What is passed to the next stage — Transformation (`PostgreSQL SQL` per Lab 2)
 | # | Problem description | Possible cause | Impact on extraction | Proposed solution / mitigation |
 | --- | --- | --- | --- | --- |
 | 1 | Supabase/PostgreSQL unreachable or connection timeout | Network outage, wrong credentials, Supabase maintenance | Run fails; no records extracted; downstream stages starved | Retry with exponential backoff (3×) via Airflow; alert on final failure; store last window for safe re-run; rotate/verify service-role credentials out-of-band |
-| 2 | Schema change breaks extractor (renamed column, new NOT NULL, changed type) | Application migration (e.g. new `system_settings` or consumer columns) without pipeline update | `Required tables/columns` check FAILs; run stopped | Fail fast + quarantine; version the data contract (6); update extractor mapping; re-run the same window after fix |
+| 2 | Schema change breaks extractor (renamed column, new NOT NULL, changed type) | Application migration (e.g. new `system_settings` or consumer columns) without pipeline update | `Required tables/columns` check FAILs; run stopped | Fail fast + quarantine; version the data contract (Section 6); update extractor mapping; re-run the same window after fix |
 | 3 | Partial extract / Airflow task killed mid-run | Worker OOM, timeout on large `consumption`/`billing` history | Staging has incomplete month; counts mismatch | Idempotent re-run of the same window using `idempotency_key`; validate `records_read == records_extracted` before promotion |
 | 4 | Missing or late monthly readings (consumer has no reading for the month) | Meter reader has not yet recorded; offline outbox not yet synced | Analytical gaps for that purok/resident; completeness WARNING | Flag as WARNING for manual review; do not fabricate readings; Transformation handles imputation policy; re-extract the window after readings sync |
 | 5 | Duplicate or out-of-order payment/billing rows from retries | Client retry without idempotency key, double-submit | PK/idempotency conflicts; inflated collections | Enforce `idempotency_key` uniqueness; deduplicate on `(billing_id, payment_date, total_paid)`; quarantine duplicates for review |
@@ -362,6 +365,6 @@ What is passed to the next stage — Transformation (`PostgreSQL SQL` per Lab 2)
 
 ## Expected Output
 
-The documentation must be consistent with the implemented extraction process and provide sufficient information for team member to understand, validate, monitor, and maintain the extraction stage.
+The documentation must be consistent with the implemented extraction process and provide sufficient information for team members to understand, validate, monitor, and maintain the extraction stage.
 
 The extracted data must be validated and packaged for handover to the next stage: Transformation. Data cleaning, standardization, and business transformations must not be performed unless explicitly required by the extraction process.
