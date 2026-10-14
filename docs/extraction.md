@@ -6,7 +6,6 @@
 
 The objective of the WaterWise Data Extraction Stage is to extract the required operational data from the existing WaterWise Supabase/PostgreSQL database and prepare a documented, traceable, and validated dataset for the succeeding Data Validation and Transformation stages.
 
-> The goal of this stage is to extract data from an identified source system and prepare a documented, traceable, and validated dataset for the next stage of the data pipeline.
 
 ---
 
@@ -58,7 +57,7 @@ Initial load is a full extraction. Succeeding runs are incremental using the sto
 | Item | Value |
 | --- | --- |
 | Frequency | Daily scheduled batch |
-| Airflow DAG | `waterwise_daily_extraction` |
+| Airflow DAG | waterwise_daily_extraction |
 | Scheduled time | Once daily (off-peak, e.g. 01:00 Asia/Manila) |
 | Retry | Up to 3 retries with backoff on connection/query failure |
 
@@ -73,7 +72,6 @@ The extraction will focus on the operational records necessary for WaterWise's a
 | Billing | `id, consumption_id, user_id, billing_date, due_date, total_bill, timestamps` | Monitor billing and account balances |
 | Payments | `id, billing_id, total_paid, amount_tendered, remaining_balance, payment_date, payment_method, timestamps` | Monitor collections and payment transactions |
 
-> **Out of scope for Stage 1 (per Lab 2 schema, deferred to later stages):** `admins`, `meter_readers`, `notifications`, `notification_reads`, `consumer_push_subscriptions`, `notification_push_jobs`, `events`, `generated_reports`, `ai_consumption_cache`, `admin_trusted_devices`, `password_reset_request_limits`, `system_settings`, and session/audit tables. Stage 1 extracts only the 4 operational tables above.
 
 ### 1.6 Source Limitations and Assumptions
 
@@ -196,13 +194,13 @@ For each validation check: check name, target, purpose, and measurable pass/fail
 | Check Name | Target | Purpose | Validation Criteria (Pass / Fail) |
 | --- | --- | --- | --- |
 | Source connection and accessibility | Supabase/PostgreSQL connection | Confirm the source is reachable before extraction | PASS: connection succeeds within timeout; FAIL: connection error → stop run, log error |
-| Required tables and columns exist | `consumers`, `consumption`, `billing`, `payments` + columns in §2 | Detect schema drift early | PASS: all required tables/columns present; FAIL: any missing → stop run |
+| Required tables and columns exist | `consumers`, `consumption`, `billing`, `payments` + columns in 2 | Detect schema drift early | PASS: all required tables/columns present; FAIL: any missing → stop run |
 | Required identifiers present | `consumers.id`, `consumption.id + consumer_id + reading_date`, `billing.id + consumption_id + user_id`, `payments.id + billing_id` | Ensure join keys exist | PASS: 0 rows with NULL identifiers; FAIL: >0 → quarantine affected rows |
 | Primary key uniqueness | PK of each extracted table | Detect duplicates in extract | PASS: 0 duplicate PKs; FAIL: >0 → fail table validation |
 | Record count and extraction completeness | Row counts per table vs. source `COUNT(*)` in window | Verify no rows lost | PASS: `extracted == source count` in window; WARNING if count differs by >0 but <1%; FAIL if mismatch beyond tolerance or 0 rows when source >0 |
 | Referential completeness | `consumption.consumer_id`, `billing.consumption_id/user_id`, `payments.billing_id` | Ensure no orphaned facts | PASS: 0 orphans; FAIL: >0 orphans → quarantine |
 | Range sanity (extraction-level only) | `present_reading >= previous_reading`, `consumption >= 0`, `total_bill >= 0` | Catch obviously corrupt extracts | PASS: 0 violations; WARNING: violations present but passed through with flag for Transformation |
-| Data extraction errors or interruptions | Airflow task / Python job | Trace partial extracts | PASS: task success, no exception; FAIL: exception/timeout → retry per §7 |
+| Data extraction errors or interruptions | Airflow task / Python job | Trace partial extracts | PASS: task success, no exception; FAIL: exception/timeout → retry per |
 
 ---
 
@@ -214,7 +212,7 @@ Each extraction run records the following fields for monitoring, troubleshooting
 | --- | --- | --- |
 | `pipeline_run_id` | Unique ID of the extraction run | `ww-extract-2026-03-10-0100` / UUID |
 | `table_name` | Table or file name extracted | `consumption` |
-| `extraction_started_at` | Extraction start timestamp | `2026-03-10T01:00:00+08:00` (ISO 8601, Asia/Manila) |
+| `extraction_started_at` | Extraction start timestamp | `2026-03-10T01:00:00+08:00` |
 | `extraction_ended_at` | Extraction end timestamp | `2026-03-10T01:04:32+08:00` |
 | `extraction_status` | Final status of the table/run | `SUCCESS` / `WARNING` / `FAILED` |
 | `records_read` | Number of records read from source | `1250` |
@@ -273,7 +271,7 @@ Usage:
 
 Expected table and column names, data types, required identifiers and constraints:
 
-- Tables: `consumers`, `consumption`, `billing`, `payments` as specified in §2.
+- Tables: `consumers`, `consumption`, `billing`, `payments` as specified in 2.
 - Required identifiers: `consumers.id`, `consumption.(id, consumer_id, reading_date)`, `billing.(id, consumption_id, user_id)`, `payments.(id, billing_id)` — all NOT NULL in the extract.
 - Constraints preserved in contract: PK uniqueness per table; FK references listed in §2; `consumption` one-row-per-consumer-per-month.
 
@@ -287,8 +285,8 @@ Expected table and column names, data types, required identifiers and constraint
 
 Unexpected changes to column names, data types, or required fields are handled as follows:
 
-1. The §3 `required tables and columns exist` check fails the run before staging write.
-2. The pipeline stops/quarantines per §7; no silent coercion.
+1. The `required tables and columns exist` check fails the run before staging write.
+2. The pipeline stops/quarantines per 7; no silent coercion.
 3. A schema-change ticket is raised; the contract is versioned and the extractor mapping updated.
 4. Backfill/re-run uses the stored extraction window after the fix.
 
@@ -326,15 +324,15 @@ Each rule defines: validation condition, acceptance criteria, pipeline action, a
 
 - **Automatic Approval:** All critical validation checks pass (connection OK, schema OK, 0 NULL identifiers, 0 PK duplicates, counts match, 0 orphans). Pipeline promotes staged `rawdata` + metadata + validation results automatically.
 - **Manual Review:** Non-critical warnings (e.g. minor count variance within tolerance, range-sanity flags for Transformation to clean). Responsible: **data engineer / Super Admin**. Action: hold promotion until reviewed and explicitly released.
-- **Rejection or Failure:** Any critical FAIL (connection loss after retries, missing table/column, PK duplicates, orphan FKs, zero-extract when source non-zero). Pipeline retries transient failures (up to 3×), otherwise quarantines the affected table extract and stops promotion. Responsible: **data engineer** investigates via §4 logs and re-triggers the window.
+- **Rejection or Failure:** Any critical FAIL (connection loss after retries, missing table/column, PK duplicates, orphan FKs, zero-extract when source non-zero). Pipeline retries transient failures (up to 3×), otherwise quarantines the affected table extract and stops promotion. Responsible: **data engineer** investigates via 4 logs and re-triggers the window.
 
 ### 7.3 Handover
 
 What is passed to the next stage — Transformation (`PostgreSQL SQL` per Lab 2) → Storage (`Existing Supabase/PostgreSQL`) → consumption via dashboard, analytics, PDF reports, demand forecasting, and administrative recommendations:
 
 - Staged raw datasets: `rawdata/consumers|consumption|billing|payments/<run_date>/` with agreed file format (e.g. Parquet/CSV + schema file).
-- Extraction metadata per §4 (run ID, window, counts, duration).
-- Validation results per §3 (per-table PASS/WARNING/FAIL + rejected-row quarantine location).
+- Extraction metadata per 4 (run ID, window, counts, duration).
+- Validation results per 3 (per-table PASS/WARNING/FAIL + rejected-row quarantine location).
 - Processing-period and grouping config carried forward per Lab 2: selected monthly or yearly period, overall or purok-level grouping.
 - Example handover summary:
 
@@ -355,7 +353,7 @@ What is passed to the next stage — Transformation (`PostgreSQL SQL` per Lab 2)
 | # | Problem description | Possible cause | Impact on extraction | Proposed solution / mitigation |
 | --- | --- | --- | --- | --- |
 | 1 | Supabase/PostgreSQL unreachable or connection timeout | Network outage, wrong credentials, Supabase maintenance | Run fails; no records extracted; downstream stages starved | Retry with exponential backoff (3×) via Airflow; alert on final failure; store last window for safe re-run; rotate/verify service-role credentials out-of-band |
-| 2 | Schema change breaks extractor (renamed column, new NOT NULL, changed type) | Application migration (e.g. new `system_settings` or consumer columns) without pipeline update | `Required tables/columns` check FAILs; run stopped | Fail fast + quarantine; version the data contract (§6); update extractor mapping; re-run the same window after fix |
+| 2 | Schema change breaks extractor (renamed column, new NOT NULL, changed type) | Application migration (e.g. new `system_settings` or consumer columns) without pipeline update | `Required tables/columns` check FAILs; run stopped | Fail fast + quarantine; version the data contract (6); update extractor mapping; re-run the same window after fix |
 | 3 | Partial extract / Airflow task killed mid-run | Worker OOM, timeout on large `consumption`/`billing` history | Staging has incomplete month; counts mismatch | Idempotent re-run of the same window using `idempotency_key`; validate `records_read == records_extracted` before promotion |
 | 4 | Missing or late monthly readings (consumer has no reading for the month) | Meter reader has not yet recorded; offline outbox not yet synced | Analytical gaps for that purok/resident; completeness WARNING | Flag as WARNING for manual review; do not fabricate readings; Transformation handles imputation policy; re-extract the window after readings sync |
 | 5 | Duplicate or out-of-order payment/billing rows from retries | Client retry without idempotency key, double-submit | PK/idempotency conflicts; inflated collections | Enforce `idempotency_key` uniqueness; deduplicate on `(billing_id, payment_date, total_paid)`; quarantine duplicates for review |
