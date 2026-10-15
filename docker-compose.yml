@@ -1,0 +1,70 @@
+name: waterwise-etl
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Shared Airflow config for scheduler + webserver.
+  # NOTE: `profiles` keeps this fragment from starting as a container.
+  airflow-base: &airflow-base
+    profiles: ["_base"]
+    image: apache/airflow:2.8.4-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: h_czeyJKsRwtnePEQMme7EK0aH6254Wora7AUWmkVGo=
+      AIRFLOW__WEBSERVER__SECRET_KEY: 4796c9a0a6a071a080e5d8e21fbf1dec
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Manila
+      # Runtime deps for pipeline/stage.py (installed at container start).
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas python-dotenv"
+    # DB credentials for the extraction job (server-side only, never frontend).
+    env_file:
+      - ./pipeline/.env
+    volumes:
+      # DAG file + pipeline package. Airflow adds the dags folder to
+      # sys.path, so `from pipeline.stage import main` resolves.
+      - ./pipeline:/opt/airflow/dags/pipeline
+      # stage.py computes these paths from its own location
+      # (BASE_DIR = <dags>/pipeline/.. = /opt/airflow/dags).
+      - ./rawdata:/opt/airflow/dags/rawdata
+      - ./logs:/opt/airflow/dags/logs
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-base
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-webserver:
+    <<: *airflow-base
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  postgres-db-volume:

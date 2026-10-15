@@ -366,6 +366,56 @@ def check_referential(all_data: dict[str, tuple[list[str], list[tuple]]]) -> lis
     return notes
 
 
+def fetch_rows_by_ids(conn, table: str, ids: set) -> list[tuple]:
+    """Fetch full rows for the given PK values (parent backfill)."""
+    contract = TABLE_CONTRACT[table]
+    cols = contract["columns"]
+    col_sql = ", ".join(f'"{c}"' for c in cols)
+    sql = f'SELECT {col_sql} FROM "{table}" WHERE "{contract["pk"]}" = ANY(%s)'
+
+    def _run():
+        with conn.cursor() as cur:
+            cur.execute(sql, (list(ids),))
+            return cur.fetchall()
+
+    return with_retry(_run, label=f"parent lookup {table}")
+
+
+def backfill_parents(conn, all_data: dict[str, tuple[list[str], list[tuple]]]) -> dict[str, int]:
+    """Fetch parent rows referenced by the delta but outside the window.
+
+    An incremental delta routinely references parents extracted in earlier
+    runs (e.g. a new payment for an old bill). Without backfill, the
+    referential check false-positives on every such delta. This pulls the
+    missing parents by PK so the check sees complete facts. Parents that
+    are genuinely absent in the source stay missing and still FAIL.
+
+    Mutates all_data in place. Returns {table: rows_added}.
+    """
+    added: dict[str, int] = {}
+    changed = True
+    while changed:
+        changed = False
+        id_sets: dict[str, set] = {}
+        for t, (cols, rows) in all_data.items():
+            pk = TABLE_CONTRACT[t]["pk"]
+            id_sets[t] = {r[cols.index(pk)] for r in rows}
+        for child, col, parent, _pcol in FK_CHECKS:
+            if child not in all_data or parent not in all_data:
+                continue
+            ccols, crows = all_data[child]
+            ci = ccols.index(col)
+            missing = {r[ci] for r in crows if r[ci] is not None} - id_sets.get(parent, set())
+            if not missing:
+                continue
+            prows = fetch_rows_by_ids(conn, parent, missing)
+            if prows:
+                all_data[parent][1].extend(prows)
+                added[parent] = added.get(parent, 0) + len(prows)
+                changed = True
+    return added
+
+
 def write_staging(table: str, cols: list[str], rows: list[tuple], run_date: str) -> Path:
     out_dir = STAGING_ROOT / table / run_date
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -515,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
     all_data: dict[str, tuple[list[str], list[tuple]]] = {}
     source_counts: dict[str, int] = {}
     per_table_status: dict[str, str] = {}
+    pending: dict[str, tuple] = {}  # successes staged only after parent backfill
     overall_rc = 0
 
     for table in tables:
@@ -535,18 +586,10 @@ def main(argv: list[str] | None = None) -> int:
             v = validate_rows(table, cols, rows, source_count=src_count)
             all_data[table] = (cols, rows)
             source_counts[table] = src_count
-            out_path = write_staging(table, cols, rows, run_date)
-            record.update({
-                "extraction_status": "SUCCESS" if v["status"] == "PASS" else ("WARNING" if v["status"] == "WARNING" else "FAILED"),
-                "records_read": src_count,
-                "records_extracted": len(rows) - v["rejected"],
-                "records_rejected": v["rejected"],
-                "validation_result": v["status"] + (": " + "; ".join(v["notes"]) if v["notes"] != ["PASS"] else ""),
-                "error_message": None,
-            })
+            # Staging/logging deferred until after parent backfill (below),
+            # so staged sets already include looked-up parents.
+            pending[table] = (record, cols, rows, src_count, v, t0)
             per_table_status[table] = v["status"]
-            log(f"{table}: read={src_count} staged={len(rows) - v['rejected']} rejected={v['rejected']} "
-                f"-> {out_path} [{v['status']}]")
             if v["status"] == "FAIL":
                 overall_rc = 1
         except Exception as exc:  # noqa: BLE001 - Section 7: retry done inside, now quarantine/stop
@@ -562,13 +605,57 @@ def main(argv: list[str] | None = None) -> int:
             overall_rc = 1
             log(f"{table}: FAILED {exc}")
         finally:
+            # Failed tables finalize immediately; successes finalize after
+            # parent backfill so staged sets include looked-up parents.
+            if table in pending:
+                continue
             ended = datetime.now(timezone.utc)
             record["extraction_ended_at"] = ended.isoformat()
             record["extraction_duration_ms"] = int((time.perf_counter() - t0) * 1000)
             lp = write_run_log(record)
             log(f"{table}: log -> {lp}")
 
+    # Parent backfill for incremental deltas (Section 3 referential
+    # completeness): a delta may reference parents outside the window.
+    parent_added: dict[str, int] = {}
+    if len(all_data) > 1:
+        try:
+            parent_added = backfill_parents(conn, all_data)
+            for t, n in parent_added.items():
+                log(f"{t}: parent lookup added {n} rows referenced by delta")
+        except Exception as exc:  # noqa: BLE001
+            log(f"parent lookup FAILED: {exc}")
+            overall_rc = 1
+            for t in all_data:
+                if per_table_status.get(t) == "PASS":
+                    per_table_status[t] = "FAIL"
+
     conn.close()
+
+    # Stage + log the successful tables (delta merged with looked-up parents).
+    for table in tables:
+        if table not in pending:
+            continue
+        record, cols, rows, src_count, v, t0 = pending[table]
+        out_path = write_staging(table, cols, rows, run_date)
+        extra = ""
+        if parent_added.get(table):
+            extra = f"; parent-lookup: +{parent_added[table]} {table} rows"
+        record.update({
+            "extraction_status": "SUCCESS" if v["status"] == "PASS" else ("WARNING" if v["status"] == "WARNING" else "FAILED"),
+            "records_read": src_count,
+            "records_extracted": len(rows) - v["rejected"],
+            "records_rejected": v["rejected"],
+            "validation_result": v["status"] + (": " + "; ".join(v["notes"]) if v["notes"] != ["PASS"] else "") + extra,
+            "error_message": None,
+        })
+        log(f"{table}: read={src_count} staged={len(rows) - v['rejected']} rejected={v['rejected']} "
+            f"-> {out_path} [{v['status']}]")
+        ended = datetime.now(timezone.utc)
+        record["extraction_ended_at"] = ended.isoformat()
+        record["extraction_duration_ms"] = int((time.perf_counter() - t0) * 1000)
+        lp = write_run_log(record)
+        log(f"{table}: log -> {lp}")
 
     # Cross-table referential check (Section 3)
     if len(all_data) > 1:

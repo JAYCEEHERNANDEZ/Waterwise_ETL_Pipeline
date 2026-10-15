@@ -51,6 +51,8 @@ For incremental extraction, the extraction window is determined per table:
 
 Initial load is a full extraction. Succeeding runs are incremental using the stored `last_successful_run` timestamp from the extraction log.
 
+**Parent backfill:** an incremental delta may reference parents outside its window (e.g. a new payment for an older bill). After extraction and before the referential check, the extractor fetches those missing parents by PK (`payments` → `billing` → `consumption` → `consumers`) and stages them with the delta, noting `parent-lookup: +N rows` in the run log. Parents genuinely absent in the source still FAIL the referential check.
+
 ### 1.4 Extraction Schedule
 
 | Item | Value |
@@ -59,6 +61,7 @@ Initial load is a full extraction. Succeeding runs are incremental using the sto
 | Airflow DAG | `waterwise_daily_extraction` |
 | Scheduled time | Once daily (off-peak, e.g. 01:00 Asia/Manila) |
 | Retry | Up to 3 retries with backoff on connection/query failure |
+| Load mode | Full load every scheduled run (complete daily snapshot; incremental windows remain available for manual/CLI runs) |
 
 ### 1.5 Extraction Scope
 

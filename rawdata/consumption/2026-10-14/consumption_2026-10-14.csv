@@ -1,1 +1,0 @@
-id,consumer_id,reading_date,previous_reading,present_reading,consumption,idempotency_key,created_at,updated_at
