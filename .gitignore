@@ -1,0 +1,8 @@
+# Secrets + generated outputs — never commit
+pipeline/.env
+.env
+rawdata/
+logs/
+__pycache__/
+*.pyc
+image/
