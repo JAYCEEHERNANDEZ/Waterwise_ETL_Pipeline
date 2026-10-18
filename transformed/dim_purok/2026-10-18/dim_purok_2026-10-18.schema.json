@@ -1,0 +1,19 @@
+{
+  "table": "dim_purok",
+  "columns": [
+    "purok_key",
+    "purok_no",
+    "purok_label",
+    "is_unknown"
+  ],
+  "required_not_null": [
+    "purok_key",
+    "purok_no",
+    "purok_label",
+    "is_unknown"
+  ],
+  "rules_version": "1.0",
+  "run_id": "ww-transform-2026-10-18-2313-285254",
+  "parent_run_id": "ww-extract-2026-10-18-1513-5e91ef",
+  "batch": "2026-10-18"
+}

@@ -5,3 +5,4 @@ WaterWise is a centralized management system for the Sucol water system. It mana
 ## Documentation
 
 - [ETL Stage 1: Data Extraction](docs/extraction.md)
+- [ETL Stage 2: Data Transformation](docs/transformation.md)
