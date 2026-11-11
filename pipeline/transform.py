@@ -1366,7 +1366,8 @@ def validate(outputs: dict[str, list[dict[str, Any]]],
             if not baseline:
                 detail_parts.append(f"{output}.{column}={rate_now}% (baseline recorded)")
             else:
-                previous = Decimal(str(baseline.get(column, 0)))
+                # Logged null_rates keys are "<table>.<column>" (see the run-log writer).
+                previous = Decimal(str(baseline.get(f"{output}.{column}", 0)))
                 if rate_now > previous:
                     degraded = True
                     detail_parts.append(f"{output}.{column}={rate_now}% > baseline {previous}%")
