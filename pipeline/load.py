@@ -81,6 +81,8 @@ except ImportError:  # pragma: no cover - surfaced by the connection check
 BASE_DIR = Path(__file__).resolve().parent.parent  # repo root (Waterwise_ETL_Pipeline/)
 TRANSFORMED_ROOT = BASE_DIR / "transformed"
 TRANSFORMATION_LOG_ROOT = BASE_DIR / "logs" / "waterwise-transformation"
+LOAD_LOG_ROOT = BASE_DIR / "logs" / "waterwise-load"
+QUARANTINE_ROOT = BASE_DIR / "quarantine" / "load"
 
 LOAD_CODE_VERSION = "v1.0"
 WAREHOUSE_SCHEMA = "warehouse"
@@ -1052,16 +1054,18 @@ def load_table(cur, item: TableHandover, batch_id: str) -> TableResult:
     return result
 
 
-def load_batch(conn, handover: Handover,
-               tables: tuple[str, ...] = LOAD_ORDER) -> dict[str, TableResult]:
+def load_batch(conn, handover: Handover, tables: tuple[str, ...] = LOAD_ORDER,
+               results: dict[str, TableResult] | None = None) -> dict[str, TableResult]:
     """Load the tables in dependency order inside the caller's transaction.
 
     Dimensions first, then fact_consumption -> fact_billing -> fact_payment, so
     every foreign key check sees the parent rows written earlier in the same
     transaction. Nothing is committed here: the caller commits only when the
     batch is accepted, and rolls back otherwise (docs/load.md Section 3).
+
+    Pass `results` to keep the tables that finished if a later one raises.
     """
-    results: dict[str, TableResult] = {}
+    results = {} if results is None else results
     with conn.cursor() as cur:
         for table in tables:
             results[table] = load_table(cur, handover.tables[table], handover.batch_id)
@@ -1320,6 +1324,204 @@ def run_post_load_checks(conn, handover: Handover, results: dict[str, TableResul
 
 
 # ---------------------------------------------------------------------------
+# Load log, rejected records, and the acceptance decision
+# (docs/load.md Sections 6, 7 and 8)
+# ---------------------------------------------------------------------------
+# Status of each load_log row:
+#   SUCCESS - the batch was committed.
+#   HELD    - MANUAL REVIEW: rolled back, waiting for a reviewer to rerun it
+#             with --accept-warnings.
+#   FAILED  - REJECTED: a critical check failed or the load raised an error;
+#             rolled back.
+# A successful run writes its load_log rows inside the batch transaction, so the
+# data and its log are committed together. A held or failed run writes them on
+# a separate connection after the rollback, so it is still recorded.
+
+LOAD_LOG_COLUMNS = (
+    "run_id", "transformation_run_id", "batch_id", "batch_window", "table_name",
+    "load_type", "load_start_ts", "load_end_ts", "load_duration_sec",
+    "records_received", "records_inserted", "records_updated", "records_rejected",
+    "status", "pre_load_result", "post_load_result", "error_code", "error_message",
+    "reviewed_by", "load_code_version",
+)
+STATUS_FOR_DECISION = {"APPROVED": "SUCCESS", "MANUAL REVIEW": "HELD", "REJECTED": "FAILED"}
+QUARANTINE_COLUMNS = ("run_id", "batch_id", "table_name", "row_no", "match_key",
+                      "reject_reason", "source_values")
+PII_COLUMNS = ("email", "contact_number")
+
+
+def mask_pii(column: str, value: str | None) -> str | None:
+    """j***@mail.com / 09***1234: enough to recognise, not enough to use."""
+    if not value:
+        return value
+    if column == "email" and "@" in value:
+        local, _, domain = value.partition("@")
+        return f"{local[:1]}***@{domain}"
+    if column == "contact_number":
+        return f"{value[:2]}***{value[-4:]}" if len(value) > 6 else "***"
+    return value
+
+
+def _code(name: str) -> str:
+    return name.upper().replace(" ", "_").replace("-", "_")
+
+
+def error_code_for(checks: list[Check],
+                   post_checks: list[Check]) -> tuple[str | None, str | None]:
+    """First failing check (critical first) as error_code, its detail as error_message."""
+    for phase, group in (("PRE_LOAD", checks), ("POST_LOAD", post_checks)):
+        for c in group:
+            if c.status in ("FAIL", "NOT RUN") and c.severity == CRITICAL:
+                if c.name == "Load errors":
+                    return "LOAD_ERROR", c.detail
+                return f"{phase}_{_code(c.name)}", c.detail
+    for phase, group in (("PRE_LOAD", checks), ("POST_LOAD", post_checks)):
+        for c in group:
+            if c.status in ("WARNING", "NOT RUN"):
+                return f"WARNING_{_code(c.name)}", c.detail
+    return None, None
+
+
+def build_log_records(run_id: str, handover: Handover, results: dict[str, TableResult],
+                      checks: list[Check], post_checks: list[Check], decision: str,
+                      status: str, started_at: datetime,
+                      reviewed_by: str | None) -> list[dict[str, Any]]:
+    """One load_log record per target table (docs/load.md Section 6).
+
+    For HELD and FAILED runs the inserted/updated counts are what the
+    rolled-back attempt wrote before it was undone; nothing of it remains.
+    """
+    error_code, error_message = (None, None) if status == "SUCCESS" else \
+        error_code_for(checks, post_checks)
+    ended_at = datetime.now(PHT)
+    records = []
+    for table in LOAD_ORDER:
+        r = results.get(table)
+        start = r.started_at if r else started_at
+        end = (r.ended_at or ended_at) if r else ended_at
+        records.append({
+            "run_id": run_id,
+            "transformation_run_id": handover.transformation_run_id,
+            "batch_id": handover.batch_id,
+            "batch_window": handover.batch_window,
+            "table_name": table,
+            "load_type": "INCREMENTAL",
+            "load_start_ts": start.isoformat(),
+            "load_end_ts": end.isoformat(),
+            "load_duration_sec": max(0, round((end - start).total_seconds())),
+            "records_received": handover.tables[table].row_count,
+            "records_inserted": r.inserted if r else 0,
+            "records_updated": r.updated if r else 0,
+            "records_rejected": len(r.rejected) if r else 0,
+            "status": status,
+            "pre_load_result": summarize_checks(checks),
+            "post_load_result": summarize_checks(post_checks) if post_checks else "NOT RUN",
+            "error_code": error_code,
+            "error_message": error_message,
+            "reviewed_by": reviewed_by,
+            "load_code_version": LOAD_CODE_VERSION,
+            # JSON copy only (not columns in load_log): the full check details.
+            "decision": decision,
+            "pre_load_checks": [c.as_dict() for c in checks],
+            "post_load_checks": [c.as_dict() for c in post_checks],
+        })
+    return records
+
+
+def insert_load_log(cur, records: list[dict[str, Any]]) -> None:
+    columns = psycopg2_sql.SQL(", ").join(_ident(c) for c in LOAD_LOG_COLUMNS)
+    placeholders = psycopg2_sql.SQL(", ").join(
+        psycopg2_sql.Placeholder() for _ in LOAD_LOG_COLUMNS)
+    statement = psycopg2_sql.SQL("INSERT INTO {t} ({cols}) VALUES ({vals})").format(
+        t=_ident(WAREHOUSE_SCHEMA, "load_log"), cols=columns, vals=placeholders)
+    for record in records:
+        cur.execute(statement, [record[c] for c in LOAD_LOG_COLUMNS])
+
+
+def write_load_log_separately(dsn: str | None, records: list[dict[str, Any]]) -> bool:
+    """Record a held or failed run on its own connection, after the rollback."""
+    if not dsn:
+        return False
+    try:
+        conn = connect_warehouse(dsn)
+    except Exception as exc:  # noqa: BLE001 - the JSON log still has the record
+        log(f"load_log not written (warehouse unreachable): {mask(str(exc).strip(), dsn)}")
+        return False
+    try:
+        with conn.cursor() as cur:
+            insert_load_log(cur, records)
+        conn.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        log(f"load_log not written: {mask(f'{type(exc).__name__}: {exc}'.strip(), dsn)}")
+        return False
+    finally:
+        conn.close()
+
+
+def write_json_logs(records: list[dict[str, Any]], run_date: str, log_root: Path) -> Path:
+    """Operational log: logs/waterwise-load/<run_date>/<run_id>_<table>.json."""
+    folder = log_root / run_date
+    folder.mkdir(parents=True, exist_ok=True)
+    for record in records:
+        path = folder / f"{record['run_id']}_{record['table_name']}.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, path)
+    return folder
+
+
+def write_quarantine(run_id: str, handover: Handover, results: dict[str, TableResult],
+                     quarantine_root: Path) -> tuple[Path | None, int]:
+    """Append rejected rows to quarantine/load/<run_date>/rejected.csv (PII masked).
+
+    Appending keeps the rejected rows of every run of this batch; the run_id
+    column tells them apart.
+    """
+    rejected = [rej for r in results.values() for rej in r.rejected]
+    if not rejected:
+        return None, 0
+    path = quarantine_root / handover.run_date / "rejected.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=QUARANTINE_COLUMNS)
+        if new_file:
+            writer.writeheader()
+        for rej in rejected:
+            values = {k: (mask_pii(k, v) if k in PII_COLUMNS else v)
+                      for k, v in rej.values.items()}
+            writer.writerow({
+                "run_id": run_id, "batch_id": handover.batch_id, "table_name": rej.table,
+                "row_no": rej.row_no, "match_key": rej.key, "reject_reason": rej.reason,
+                "source_values": json.dumps(values, ensure_ascii=False),
+            })
+    return path, len(rejected)
+
+
+def table_result_label(r: TableResult | None, load_error: str | None) -> str:
+    if r is None or load_error:
+        return "FAIL"
+    if _pct(len(r.rejected), r.received) > REJECT_LIMIT_PCT:
+        return "FAIL"
+    return "WARNING" if r.rejected else "PASS"
+
+
+def print_summary(results: dict[str, TableResult], load_error: str | None,
+                  decision: str, status: str, reviewed_by: str | None) -> None:
+    """Completion report (docs/load.md Section 8, Completion and Handover)."""
+    log("Validation Summary:")
+    for table in LOAD_ORDER:
+        r = results.get(table)
+        counts = (f"received={r.received} inserted={r.inserted} updated={r.updated} "
+                  f"rejected={len(r.rejected)}") if r else "not loaded"
+        log(f"  {table + ' load':<24} {table_result_label(r, load_error):<8} {counts}")
+    shown = f"{decision} (reviewed by {reviewed_by})" if reviewed_by else decision
+    log(f"  {'Overall Load':<24} {shown}  -> load_log status {status}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1332,10 +1534,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="load a batch that was already loaded with SUCCESS")
     parser.add_argument("--handover-released-by", default=None, metavar="NAME",
                         help="reviewer who released a transformation batch on MANUAL REVIEW")
+    parser.add_argument("--accept-warnings", default=None, metavar="NAME",
+                        help="reviewer who accepts non-critical warnings; publishes a "
+                             "MANUAL REVIEW batch (never a critical failure)")
     parser.add_argument("--transformed-root", default=None,
                         help="handover root (default transformed/)")
     parser.add_argument("--transformation-log-root", default=None,
                         help="transformation log root (default logs/waterwise-transformation/)")
+    parser.add_argument("--log-root", default=None,
+                        help="load JSON log root (default logs/waterwise-load/)")
+    parser.add_argument("--quarantine-root", default=None,
+                        help="rejected-records root (default quarantine/load/)")
     return parser.parse_args(argv)
 
 
@@ -1348,6 +1557,11 @@ def new_run_id() -> str:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     run_id = args.run_id or new_run_id()
+    log_root = Path(args.log_root) if args.log_root else LOAD_LOG_ROOT
+    quarantine_root = Path(args.quarantine_root) if args.quarantine_root else QUARANTINE_ROOT
+    if args.accept_warnings is not None and not args.accept_warnings.strip():
+        print("--accept-warnings needs the reviewer's name", file=sys.stderr)
+        return 2
 
     try:
         handover = read_handover(
@@ -1370,52 +1584,84 @@ def main(argv: list[str] | None = None) -> int:
         released_by=args.handover_released_by,
     )
     print_checks("Pre-load validation checks (docs/load.md Section 4):", checks)
-    decision = decide(checks)
     log(f"pre_load_result = {summarize_checks(checks)}")
-    if decision == "REJECTED":
-        if conn is not None:
-            conn.close()
-        log("REJECTED: a critical pre-load check failed. Nothing was written to the warehouse.")
-        return 1
+    decision = decide(checks)
+
+    results: dict[str, TableResult] = {}
+    post_checks: list[Check] = []
+    load_error: str | None = None
+    reviewed_by = "; ".join(n for n in (args.handover_released_by, args.accept_warnings)
+                            if n) or None
+    committed = False
 
     # --- Load: the whole batch is one transaction (docs/load.md Section 3) ---
     # `committed` stays False on every path except the final commit, so the
     # `finally` block rolls back on any error, including Ctrl+C. If the process
     # dies outright, PostgreSQL discards the open transaction by itself.
-    committed = False
-    try:
-        log(f"Loading {handover.batch_id} in one transaction: " + " -> ".join(LOAD_ORDER))
-        results: dict[str, TableResult] | None = None
-        load_error: str | None = None
+    if decision != "REJECTED":
         try:
-            results = load_batch(conn, handover)
-            print_results(results)
-        except Exception as exc:  # noqa: BLE001 - any load error rejects the batch
+            log(f"Loading {handover.batch_id} in one transaction: " + " -> ".join(LOAD_ORDER))
+            try:
+                load_batch(conn, handover, results=results)
+                print_results(results)
+            except Exception as exc:  # noqa: BLE001 - any load error rejects the batch
+                load_error = mask(f"{type(exc).__name__}: {str(exc).strip()}", dsn)
+
+            post_checks = run_post_load_checks(
+                conn, handover, None if load_error else results, started_at, load_error)
+            print_checks("Post-load validation checks (docs/load.md Section 5):", post_checks)
+            log(f"post_load_result = {summarize_checks(post_checks)}")
+            decision = decide(checks + post_checks)
+
+            # Section 8: a reviewer may accept warnings, never a critical failure.
+            if decision == "MANUAL REVIEW" and args.accept_warnings:
+                log(f"Warnings accepted by {args.accept_warnings}.")
+                decision = "APPROVED"
+            if decision == "APPROVED":
+                records = build_log_records(run_id, handover, results, checks, post_checks,
+                                            decision, "SUCCESS", started_at, reviewed_by)
+                with conn.cursor() as cur:
+                    insert_load_log(cur, records)   # committed together with the data
+                conn.commit()
+                committed = True
+        except Exception as exc:  # noqa: BLE001 - e.g. the commit itself failed
             load_error = mask(f"{type(exc).__name__}: {str(exc).strip()}", dsn)
-
-        post_checks = run_post_load_checks(conn, handover, results, started_at, load_error)
-        print_checks("Post-load validation checks (docs/load.md Section 5):", post_checks)
-        log(f"post_load_result = {summarize_checks(post_checks)}")
-
-        decision = decide(checks + post_checks)
-        if decision == "REJECTED":
-            log("REJECTED: a critical check failed. Transaction rolled back; "
-                "nothing was published.")
-            return 1
-        if decision == "MANUAL REVIEW":
-            log("MANUAL REVIEW: no critical failure, but a non-critical check needs review. "
-                "Transaction rolled back; nothing was published.")
-            return 3
-        conn.commit()
-        committed = True
-        log(f"APPROVED: committed {handover.batch_id}: "
-            + ", ".join(f"{t} +{r.inserted} new / {r.updated} updated"
-                        for t, r in results.items()))
-        return 0
-    finally:
-        if not committed:
-            conn.rollback()
+            post_checks.append(check_load_errors(load_error))
+            decision = "REJECTED"
+        finally:
+            if not committed:
+                conn.rollback()
+            conn.close()
+    elif conn is not None:
         conn.close()
+
+    status = "SUCCESS" if committed else STATUS_FOR_DECISION[decision]
+    if not committed:
+        records = build_log_records(run_id, handover, results, checks, post_checks,
+                                    decision, status, started_at, reviewed_by)
+        if not write_load_log_separately(dsn, records):
+            log("load_log: written to the JSON log only.")
+
+    json_folder = write_json_logs(records, handover.run_date, log_root)
+    quarantine_path, quarantined = write_quarantine(run_id, handover, results, quarantine_root)
+    log(f"Load log: {WAREHOUSE_SCHEMA}.load_log and {json_folder}")
+    if quarantine_path:
+        log(f"Rejected records: {quarantined} row(s) -> {quarantine_path}")
+
+    print_summary(results, load_error, decision, status, reviewed_by)
+    if committed:
+        log(f"APPROVED: {handover.batch_id} committed and published "
+            f"(transformation run {handover.transformation_run_id}). "
+            f"{WAREHOUSE_SCHEMA}.latest_successful_load now shows this batch.")
+        return 0
+    if decision == "MANUAL REVIEW":
+        log("MANUAL REVIEW: rolled back, nothing was published. Responsible: data engineer / "
+            "Super Admin. Review the checks above and the rejected-records file, then rerun "
+            'with --accept-warnings "<reviewer>" to publish.')
+        return 3
+    log("REJECTED: rolled back, nothing was published. Fix the cause, then rerun the "
+        "same batch.")
+    return 1
 
 
 if __name__ == "__main__":
