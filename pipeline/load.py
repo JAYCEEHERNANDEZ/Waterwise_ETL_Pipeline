@@ -11,9 +11,11 @@ Implements docs/load.md:
 Implemented so far:
 - Reading and describing the transformation handover (Section 1, Load Input).
 - Pre-load validation checks (Section 4). They only read; nothing is written.
-- Loading the dimensions dim_purok and dim_consumer (Section 3): bulk copy into
-  a staging table, reject rows that break a target constraint, then upsert on
-  the match key (SCD Type 1). Committed only when nothing was rejected.
+- Loading all five tables in one transaction (Section 3), dimensions before
+  facts: bulk copy into a staging table, reject rows that break a target
+  constraint or have no parent row, then upsert on the match key (SCD Type 1).
+  The batch is committed only when nothing was rejected; on any error the
+  whole batch is rolled back, so no partial data remains.
 
 Connection: WAREHOUSE_DB_URL (session pooler, role etl_loader), read from
 pipeline/.env or the repo-root .env. Never committed, never logged.
@@ -159,7 +161,6 @@ LOAD_ORDER = (
     "fact_billing",
     "fact_payment",
 )
-DIMENSIONS = ("dim_purok", "dim_consumer")
 
 # docs/load.md Section 2 and 3: surrogate primary key, and the match key the
 # upsert uses to find an existing row (the natural key from the source).
@@ -1049,11 +1050,18 @@ def load_table(cur, item: TableHandover, batch_id: str) -> TableResult:
     return result
 
 
-def load_dimensions(conn, handover: Handover) -> dict[str, TableResult]:
-    """Load dim_purok then dim_consumer inside the caller's transaction."""
+def load_batch(conn, handover: Handover,
+               tables: tuple[str, ...] = LOAD_ORDER) -> dict[str, TableResult]:
+    """Load the tables in dependency order inside the caller's transaction.
+
+    Dimensions first, then fact_consumption -> fact_billing -> fact_payment, so
+    every foreign key check sees the parent rows written earlier in the same
+    transaction. Nothing is committed here: the caller commits only when the
+    batch is accepted, and rolls back otherwise (docs/load.md Section 3).
+    """
     results: dict[str, TableResult] = {}
     with conn.cursor() as cur:
-        for table in DIMENSIONS:
+        for table in tables:
             results[table] = load_table(cur, handover.tables[table], handover.batch_id)
     return results
 
@@ -1126,30 +1134,36 @@ def main(argv: list[str] | None = None) -> int:
         log("REJECTED: a critical pre-load check failed. Nothing was written to the warehouse.")
         return 1
 
-    # --- Load (one transaction; docs/load.md Section 3) ----------------------
+    # --- Load: the whole batch is one transaction (docs/load.md Section 3) ---
+    # `committed` stays False on every path except the final commit, so the
+    # `finally` block rolls back on any error, including Ctrl+C. If the process
+    # dies outright, PostgreSQL discards the open transaction by itself.
+    committed = False
     try:
-        log("Loading dimensions (upsert, SCD Type 1):")
-        results = load_dimensions(conn, handover)
+        log(f"Loading {handover.batch_id} in one transaction: " + " -> ".join(LOAD_ORDER))
+        try:
+            results = load_batch(conn, handover)
+        except Exception as exc:  # noqa: BLE001 - any load error rejects the batch
+            log(f"REJECTED: load error, transaction rolled back: "
+                f"{mask(f'{type(exc).__name__}: {str(exc).strip()}', dsn)}")
+            return 1
         print_results(results)
-    except Exception as exc:  # noqa: BLE001 - any error rolls the batch back
-        conn.rollback()
-        conn.close()
-        log(f"REJECTED: load error, transaction rolled back: "
-            f"{mask(f'{type(exc).__name__}: {str(exc).strip()}', dsn)}")
-        return 1
 
-    rejected = sum(len(r.rejected) for r in results.values())
-    if decision == "MANUAL REVIEW" or rejected:
-        conn.rollback()
+        rejected = sum(len(r.rejected) for r in results.values())
+        if decision == "MANUAL REVIEW" or rejected:
+            log(f"MANUAL REVIEW: {rejected} rejected row(s) or a pre-load warning. "
+                "Transaction rolled back; nothing was published.")
+            return 3
+        conn.commit()
+        committed = True
+        log(f"Committed {handover.batch_id}: "
+            + ", ".join(f"{t} +{r.inserted} new / {r.updated} updated"
+                        for t, r in results.items()))
+        return 0
+    finally:
+        if not committed:
+            conn.rollback()
         conn.close()
-        log(f"MANUAL REVIEW: {rejected} rejected row(s) or a pre-load warning. "
-            "Transaction rolled back; nothing was published.")
-        return 3
-    conn.commit()
-    conn.close()
-    log(f"Committed {handover.batch_id}: "
-        + ", ".join(f"{t} +{r.inserted} new / {r.updated} updated" for t, r in results.items()))
-    return 0
 
 
 if __name__ == "__main__":
