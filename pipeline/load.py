@@ -8,38 +8,47 @@ Implements docs/load.md:
 - Target: the WaterWise warehouse (second Supabase project, schema
   `warehouse`, created by db/warehouse_schema.sql).
 
-Implemented so far:
-- Reading and describing the transformation handover (Section 1, Load Input).
-- Pre-load validation checks (Section 4). They only read; nothing is written.
-- Loading all five tables in one transaction (Section 3), dimensions before
-  facts: bulk copy into a staging table, reject rows that break a target
-  constraint or have no parent row, then upsert on the match key (SCD Type 1).
-  On any error the whole batch is rolled back, so no partial data remains.
-- Post-load validation and reconciliation (Section 5), inside the same
-  transaction before the commit. The batch is committed only when every pre-
-  and post-load check passes; a warning or a critical failure rolls it back.
+Steps of one run:
+1. Read the transformation handover (Section 1, Load Input).
+2. Pre-load validation checks (Section 4). They only read.
+3. Load all five tables in one transaction (Section 3), dimensions before
+   facts: bulk copy into a staging table, reject rows that break a target
+   constraint or have no parent row, then upsert on the match key (SCD Type 1).
+4. Post-load validation and reconciliation (Section 5), inside the same
+   transaction before the commit.
+5. Decide (Section 8): APPROVED commits; MANUAL REVIEW and REJECTED roll back.
+6. Record the run in warehouse.load_log and logs/waterwise-load/, and rejected
+   rows in quarantine/load/ (Sections 6 and 7).
 
 Connection: WAREHOUSE_DB_URL (session pooler, role etl_loader), read from
 pipeline/.env or the repo-root .env. Never committed, never logged.
 
 Usage:
-    # Check the newest handover against the warehouse
+    # Load the newest handover
     python -m pipeline.load
 
-    # Check the handover of a specific transformation run date
+    # Load the handover of a specific transformation run date
     python -m pipeline.load --run-date 2026-03-10
 
-    # A batch that was already loaded with SUCCESS (intentional reload)
-    python -m pipeline.load --run-date 2026-03-10 --force-reload
+    # Run every check and the full load, then roll back; writes nothing
+    python -m pipeline.load --run-date 2026-03-10 --dry-run
+
+    # Publish a batch held for warnings, after reviewing it
+    python -m pipeline.load --run-date 2026-03-10 --accept-warnings "Juan Dela Cruz"
 
     # A transformation batch on MANUAL REVIEW, released by a named reviewer
     python -m pipeline.load --handover-released-by "Juan Dela Cruz"
 
+    # Load a batch that was already loaded with SUCCESS (intentional reload)
+    python -m pipeline.load --run-date 2026-03-10 --force-reload
+
 Exit codes:
-    0 = all pre-load checks PASS
-    3 = no critical failure, but one or more non-critical WARNING
-    1 = one or more critical FAIL (the load must not start)
+    0 = APPROVED (committed; with --dry-run: would be committed)
+    3 = MANUAL REVIEW (rolled back, waiting for --accept-warnings)
+    1 = REJECTED (rolled back)
     2 = usage / input error (no handover to read)
+
+Tests: python -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
@@ -1545,6 +1554,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="load JSON log root (default logs/waterwise-load/)")
     parser.add_argument("--quarantine-root", default=None,
                         help="rejected-records root (default quarantine/load/)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="run every check and the full load, then roll back; writes "
+                             "nothing (no data, no load_log, no JSON log, no quarantine)")
     return parser.parse_args(argv)
 
 
@@ -1617,7 +1629,9 @@ def main(argv: list[str] | None = None) -> int:
             if decision == "MANUAL REVIEW" and args.accept_warnings:
                 log(f"Warnings accepted by {args.accept_warnings}.")
                 decision = "APPROVED"
-            if decision == "APPROVED":
+            if decision == "APPROVED" and args.dry_run:
+                log("DRY-RUN: the batch would be committed; rolling back instead.")
+            elif decision == "APPROVED":
                 records = build_log_records(run_id, handover, results, checks, post_checks,
                                             decision, "SUCCESS", started_at, reviewed_by)
                 with conn.cursor() as cur:
@@ -1634,6 +1648,13 @@ def main(argv: list[str] | None = None) -> int:
             conn.close()
     elif conn is not None:
         conn.close()
+
+    if args.dry_run:
+        # Nothing was committed; also write no load_log, JSON log or quarantine.
+        print_summary(results, load_error, decision, "not written (dry run)", reviewed_by)
+        log(f"DRY-RUN finished: decision {decision}. Nothing was written to the warehouse, "
+            "load_log, the JSON log, or quarantine.")
+        return {"APPROVED": 0, "MANUAL REVIEW": 3}.get(decision, 1)
 
     status = "SUCCESS" if committed else STATUS_FOR_DECISION[decision]
     if not committed:
