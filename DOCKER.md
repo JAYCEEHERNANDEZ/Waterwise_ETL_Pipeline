@@ -5,6 +5,7 @@ Runs two DAGs:
 | DAG | File | Schedule (Asia/Manila) |
 | --- | --- | --- |
 | `waterwise_daily_extraction` | `pipeline/dag_waterwise_daily_extraction.py` | daily 01:00, 3 retries |
+| `waterwise_daily_transformation` | `pipeline/dag_waterwise_daily_transformation.py` | daily 02:00, 3 retries 5 minutes apart, only on a read error or when no staged batch exists yet |
 | `waterwise_daily_load` | `pipeline/dag_waterwise_daily_load.py` | daily 03:00, 3 retries 5 minutes apart, only when the warehouse is unreachable |
 
 ## Prereqs
@@ -33,7 +34,8 @@ docker compose up -d
 
 Then open **http://localhost:8080**, log in as `admin` / `admin`
 (change the password in the UI), and unpause
-`waterwise_daily_extraction` and `waterwise_daily_load`.
+`waterwise_daily_extraction`, `waterwise_daily_transformation` and
+`waterwise_daily_load`.
 
 > First start downloads ~1 GB of images and pip-installs
 > `psycopg2-binary pandas python-dotenv` in the containers —
@@ -75,6 +77,9 @@ docker compose down -v       # stop + wipe metadata DB (runs history)
   `python -m pipeline.stage --dry-run`. The load logic stays in
   `pipeline/load.py` and runs standalone the same way:
   `python -m pipeline.load --dry-run`.
-- There is no transformation DAG yet. Until there is, run
-  `python -m pipeline.transform` before 03:00, or the load finds no new
-  batch and fails on the duplicate-batch check.
+- The three DAGs run one after another by schedule (01:00 extract,
+  02:00 transform, 03:00 load); each works on the newest batch the step
+  before it produced. If a step fails, the next one finds no new batch:
+  the load then fails on the duplicate-batch check instead of loading
+  the same data twice. Fix the failed step, rerun it, then trigger the
+  next DAG by hand.
