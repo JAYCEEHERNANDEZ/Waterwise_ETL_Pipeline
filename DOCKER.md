@@ -1,13 +1,23 @@
 # WaterWise Airflow on Docker — setup guide
 
-Runs `waterwise_daily_extraction` (daily 01:00 Asia/Manila, 3 retries)
-from `pipeline/dag_waterwise_daily_extraction.py`.
+Runs two DAGs:
+
+| DAG | File | Schedule (Asia/Manila) |
+| --- | --- | --- |
+| `waterwise_daily_extraction` | `pipeline/dag_waterwise_daily_extraction.py` | daily 01:00, 3 retries |
+| `waterwise_daily_load` | `pipeline/dag_waterwise_daily_load.py` | daily 03:00, 3 retries 5 minutes apart, only when the warehouse is unreachable |
 
 ## Prereqs
 
 - Docker Desktop running (`docker run hello-world` works).
 - `pipeline/.env` holds `WATERWISE_DB_URL` (pooler `:6543`, password
   URL-encoded: `?`->`%3F` `@`->`%40`). Never commit this file.
+- For the load, `pipeline/.env` also holds `WAREHOUSE_DB_URL`: the
+  session pooler URL (`:5432`) of the warehouse Supabase project, with
+  the `etl_loader` role. Only `pipeline/.env` is passed to the containers,
+  so a value in the repo-root `.env` is not seen by Airflow.
+- The warehouse tables exist: run `db/warehouse_schema.sql` once in the
+  warehouse project's SQL Editor.
 
 ## First-time init (run once, in this folder)
 
@@ -23,7 +33,7 @@ docker compose up -d
 
 Then open **http://localhost:8080**, log in as `admin` / `admin`
 (change the password in the UI), and unpause
-`waterwise_daily_extraction`.
+`waterwise_daily_extraction` and `waterwise_daily_load`.
 
 > First start downloads ~1 GB of images and pip-installs
 > `psycopg2-binary pandas python-dotenv` in the containers —
@@ -33,8 +43,20 @@ Then open **http://localhost:8080**, log in as `admin` / `admin`
 
 - UI shows green/red per run, logs, manual **Trigger DAG**, and
   **Clear/Retry** for re-running a window (idempotent — safe to repeat).
-- Outputs land in `./rawdata/` and `./logs/` on your machine
-  (mounted into the containers).
+- Outputs land in `./rawdata/`, `./transformed/`, `./quarantine/` and
+  `./logs/` on your machine (mounted into the containers).
+- A red `load` task means the batch was not published; nothing was
+  written. The task log, `warehouse.load_log` and
+  `logs/waterwise-load/` name the failed check; rejected rows are in
+  `quarantine/load/<run_date>/rejected.csv`.
+- A batch held for **MANUAL REVIEW** is published after review with:
+
+  ```powershell
+  docker compose exec -w /opt/airflow/dags airflow-scheduler `
+    python -m pipeline.load --accept-warnings "<your name>"
+  ```
+
+  Add `--dry-run` to any load command to run every check and roll back.
 
 ## Useful commands
 
@@ -50,4 +72,9 @@ docker compose down -v       # stop + wipe metadata DB (runs history)
 - Timezone is `Asia/Manila`, so cron `0 1 * * *` = 01:00 Manila.
 - Airflow here is the **scheduler/monitor**; extraction logic stays in
   `pipeline/stage.py` and also runs standalone:
-  `python -m pipeline.stage --dry-run`.
+  `python -m pipeline.stage --dry-run`. The load logic stays in
+  `pipeline/load.py` and runs standalone the same way:
+  `python -m pipeline.load --dry-run`.
+- There is no transformation DAG yet. Until there is, run
+  `python -m pipeline.transform` before 03:00, or the load finds no new
+  batch and fails on the duplicate-batch check.
