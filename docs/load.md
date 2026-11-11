@@ -4,442 +4,295 @@
 
 ### Objective
 
-The objective of the WaterWise Data Load Stage is to load the validated, transformed dataset handed over from the Transformation Stage (`docs/transformation.md`) into the WaterWise warehouse database, and to confirm that the loaded data is complete, accurate, traceable, and ready for dashboards, reports, and analysis.
+The goal of this stage is to load the validated, transformed dataset handed over from the Transformation Stage (`docs/transformation.md`) into the WaterWise warehouse database, and to confirm that the loaded data is complete, accurate, traceable, and ready for use by reports, dashboards, or analysis.
 
 This pipeline is **batch only**. Data is loaded in scheduled, bounded batches. Streaming, micro-batch, and real-time loading are out of scope.
-
-```
-Main DB (Supabase)  →  Stage 1 Extraction  →  Stage 2 Transformation  →  Stage 3 Load  →  Warehouse DB (second Supabase project)
-     read only             rawdata/               transformed/            this stage          written only by this stage
-```
 
 ---
 
 ## 1. Load Source and Target Specification
 
-### 1.1 Load Input
+- **Load Input**
+  - **Name and location of the transformed output:** CSV files (UTF-8, with header) received from the Transformation Stage at `transformed/<table>/<run_date>/<table>_<run_date>.csv`, for `dim_purok`, `dim_consumer`, `fact_consumption`, `fact_billing`, and `fact_payment`. Each file comes with a `.schema.json` file (column list and NOT NULL columns) and a transformation run log at `logs/waterwise-transformation/<run_date>/<run_id>_<table>.json` (status, record counts, file checksums).
+  - **Transformation run ID:** the `run_id` of the Stage 2 run, e.g. `ww-transform-2026-03-10-0200-7b3e42`.
+  - **Batch ID:** one batch per transformation run date, `ww-batch-<run_date>`, e.g. `ww-batch-2026-03-10`.
+  - **Batch window:** `batch_window_start` to `batch_window_end` from the transformation log, e.g. `2026-03-10T00:00:00+08:00` to `2026-03-10T23:59:59+08:00`. Each daily batch is a complete snapshot, because the scheduled extraction runs in full mode (`docs/extraction.md` §1.4).
+- **Target System**
+  - **Name and purpose of the target:** WaterWise Warehouse — an analytical database for dashboards, PDF reports, demand forecasting, and administrative recommendations. It is a second Supabase project, separate from the main WaterWise application database, so loads and analytical queries can never affect billing and payment operations.
+  - **Database management system:** PostgreSQL (Supabase).
+  - **Target schema:** `warehouse`, created by `db/warehouse_schema.sql`.
+- **Load Method**
+  - **Load tool:** Python 3.10+ with `psycopg2` (`pipeline/load.py`), scheduled by Apache Airflow (DAG `waterwise_daily_load`).
+  - **Batch frequency and schedule:** daily at 03:00 Asia/Manila, after the 02:00 transformation completes.
+  - **How data is written:** bulk insert followed by merge/upsert. Each CSV is bulk-inserted into a temporary staging table, then merged into the target table with one `INSERT ... ON CONFLICT ... DO UPDATE` statement per table. No row-by-row inserts are used.
+- **Load Scope**
+  - **Tables loaded and order:** dimensions before facts, parents before children: `dim_purok` → `dim_consumer` → `fact_consumption` → `fact_billing` → `fact_payment`. One `load_log` row is written per table per run.
+  - **Expected number of records and time window:** up to about 50,000 rows in total per batch (a full snapshot of one barangay water system). The load must finish within 15 minutes (by 03:15), before office hours when dashboards are used.
+- **Limitations and Assumptions**
+  - **Limitations:**
+    - The load depends on the availability of the warehouse Supabase project and on network access to it.
+    - The Supabase free plan limits the database to 500 MB of storage, has no automatic backups, and pauses a project after about 7 days without activity.
+    - The connection goes through the Supabase pooler, which limits the number of connections; the load uses two.
+    - The load runs off-peak (03:00). Dashboards only read data and are not blocked by the load, so no locking window during business hours is needed.
+  - **Account or role used for loading:** role `etl_loader`. Privileges: `USAGE` on schema `warehouse`; `SELECT`, `INSERT`, `UPDATE` on the dimension and fact tables; `SELECT`, `INSERT` on `load_log`; temporary tables. It has no `DELETE`, no DDL, and no access to the main database. Dashboards use a separate read-only role, `warehouse_reader`. The connection string is kept in the `WAREHOUSE_DB_URL` environment variable and is never written in documentation, code, or logs.
 
-| Item | Description |
-| --- | --- |
-| **Input origin** | Stage 2 handover only. This stage does **not** connect to the main WaterWise database, does not re-extract, and does not re-transform. |
-| **Transformed datasets** | `transformed/<table>/<run_date>/<table>_<run_date>.csv` (UTF-8 CSV with header) for `dim_purok`, `dim_consumer`, `fact_consumption`, `fact_billing`, `fact_payment` |
-| **Schema sidecar** | `transformed/<table>/<run_date>/<table>_<run_date>.schema.json` — column list, NOT NULL columns, `rules_version`, `run_id`, `parent_run_id` |
-| **Transformation run logs** | `logs/waterwise-transformation/<run_date>/<run_id>_<table>.json` — `transformation_status`, `records_output`, `output_checksums`, batch window |
-| **Transformation run ID** | `run_id` of the Stage 2 run, e.g. `ww-transform-2026-03-10-0200-7b3e42`. Stored in the warehouse as `transformation_run_id`. |
-| **Batch ID** | One batch = one transformation run date: `ww-batch-<run_date>`, e.g. `ww-batch-2026-03-10` |
-| **Batch window** | `batch_window_start` to `batch_window_end` from the transformation log, e.g. `2026-03-10T00:00:00+08:00` to `2026-03-10T23:59:59+08:00` |
-
-Each daily batch is a **complete snapshot**: the scheduled extraction runs in full mode (`docs/extraction.md` §1.4), so every handover contains all current consumers, readings, bills, and payments.
-
-### 1.2 Target System
-
-| Item | Description |
-| --- | --- |
-| **Target name** | WaterWise Warehouse |
-| **Purpose** | Analytical database for dashboards, PDF reports, demand forecasting, and administrative recommendations. Kept separate from the main application database so analytical queries and loads can never affect billing and payment operations. |
-| **Hosting** | A second Supabase project, separate from the main WaterWise project |
-| **Database management system** | PostgreSQL (Supabase) |
-| **Target schema** | `warehouse` (a dedicated schema, not `public`, so the tables are not exposed through the Supabase auto-generated API) |
-| **Schema definition** | `db/warehouse_schema.sql` |
-
-### 1.3 Load Method
-
-| Item | Description |
-| --- | --- |
-| **Load tool** | Python 3.10+ with `psycopg2` — `pipeline/load.py` |
-| **Orchestration** | Apache Airflow — DAG `waterwise_daily_load` |
-| **Frequency / schedule** | Daily at 03:00 Asia/Manila, after the 02:00 transformation completes |
-| **Connection** | `WAREHOUSE_DB_URL` environment variable (Supabase session pooler). Stored only in `pipeline/.env`, which is not committed. |
-| **How data is written** | **Bulk load + merge.** Each CSV is bulk-inserted into a temporary staging table, validated there, then merged into the target table with one `INSERT ... ON CONFLICT ... DO UPDATE` (upsert) statement per table. No row-by-row inserts. |
-
-### 1.4 Load Scope
-
-Tables are loaded in dependency order — dimensions before facts, parents before children:
-
-```
-dim_purok → dim_consumer → fact_consumption → fact_billing → fact_payment
-```
-
-| Item | Value |
-| --- | --- |
-| **Tables loaded** | The five tables above, plus one `load_log` row per table per run |
-| **Expected records per batch** | Up to about 50,000 rows in total across all tables (a full snapshot of one barangay water system). `dim_purok` is under 20 rows. |
-| **Time window** | The load must finish within **15 minutes** (by 03:15), well before office hours when dashboards are used. A run longer than 15 minutes is reported as a warning. |
-
-### 1.5 Limitations and Assumptions
-
-**Limitations:**
-
-- The load depends on the availability of the warehouse Supabase project and on network access to it.
-- The Supabase free plan limits the database to **500 MB** and pauses a project after about 7 days without activity. The daily load keeps the project active.
-- The free plan has no automatic backups (see Section 7.4).
-- The connection goes through the Supabase pooler, which limits the number of connections. The load uses one connection for data and one for logging.
-
-**Assumptions:**
-
-- The load runs off-peak (03:00). Dashboards only read, and PostgreSQL readers are not blocked by the load, so no locking window is needed.
-- Deterministic surrogate keys from Stage 2 (`docs/transformation.md` §1.4) are stable, so the same record always has the same key in every batch.
-- The handover is trusted for content but verified for integrity: this stage checks counts, checksums, and constraints, and reports problems — it never repairs data.
-
-**Load account:**
-
-| Role | Used by | Privileges |
-| --- | --- | --- |
-| `etl_loader` | `pipeline/load.py` | `USAGE` on schema `warehouse`; `SELECT`, `INSERT`, `UPDATE` on the dimension and fact tables; `SELECT`, `INSERT` on `load_log` (append-only: no `UPDATE`, no `DELETE`); temporary tables. No `DELETE`, no DDL, no access to any other schema, and no access to the main database. |
-| `warehouse_reader` | Dashboards and reports | `SELECT` only on schema `warehouse` |
-| Project owner (`postgres`) | Data engineer, manually | Runs `db/warehouse_schema.sql` and maintenance. Not used by the pipeline. |
-
-Passwords and connection strings are never written in this document, in code, or in logs.
-
-> **Requirement:** the load uses only the data handed over from the Transformation Stage. Nothing is re-extracted or re-transformed in this stage.
+**Requirement:** The load uses only the data handed over from the Transformation Stage. Nothing is re-extracted or re-transformed in this stage.
 
 ---
 
 ## 2. Target Tables and Column Specification
 
-All tables live in the `warehouse` schema. Column names and types follow the transformed data contract (`docs/transformation.md` §6.1); only the columns important to loading are listed here.
-
-### 2.1 Overview
-
 | Table | Type | Primary Key | Foreign Keys | Key Constraints | Purpose |
 | --- | --- | --- | --- | --- | --- |
-| `dim_purok` | Dimension | `purok_key` | None | `purok_no` UNIQUE, NOT NULL | Zones (puroks) for per-area reporting |
-| `dim_consumer` | Dimension | `consumer_key` | `purok_key` → `dim_purok` | `consumer_id` UNIQUE, NOT NULL; `status` in code set | Consumer attributes for reporting |
-| `fact_consumption` | Fact | `consumption_key` | `consumer_key` → `dim_consumer` | `consumption_id` UNIQUE; `consumption >= 0`; `present_reading >= previous_reading` | Monthly meter readings |
-| `fact_billing` | Fact | `billing_key` | `consumption_key` → `fact_consumption`; `consumer_key` → `dim_consumer` | `billing_id` UNIQUE; `total_bill >= 0`; `remaining_balance >= 0` | Bills, balances, and aging |
-| `fact_payment` | Fact | `payment_key` | `billing_key` → `fact_billing` | `payment_id` UNIQUE; `total_paid >= 0` | Payment transactions |
-| `load_log` | Log / audit | `load_log_id` | None | `run_id`, `batch_id`, `table_name`, `status` NOT NULL | One row per table per load run (Section 6) |
+| `dim_purok` | Dimension | `purok_key` | None | `purok_no` UNIQUE, NOT NULL | Zone (purok) attributes for per-area reporting |
+| `dim_consumer` | Dimension | `consumer_key` | `purok_key` | `consumer_id` UNIQUE, NOT NULL | Consumer attributes for reporting |
+| `fact_consumption` | Fact | `consumption_key` | `consumer_key` | `consumption_id` UNIQUE; `consumption >= 0` | Monthly meter readings for analysis |
+| `fact_billing` | Fact | `billing_key` | `consumption_key`, `consumer_key` | `billing_id` UNIQUE; `total_bill >= 0` | Bills and balances for analysis |
+| `fact_payment` | Fact | `payment_key` | `billing_key` | `payment_id` UNIQUE; `total_paid >= 0` | Payment transactions for analysis |
+| `load_log` | Log | `load_log_id` | None | `run_id`, `batch_id`, `table_name`, `status` NOT NULL | Record of every load run |
 
-### 2.2 Columns Added by the Load Stage
+All tables are in the `warehouse` schema. Column names and types follow the transformed data contract (`docs/transformation.md` §6.1). Every dimension and fact table also has two columns added by the load: `load_batch_id` (the batch ID column) and `loaded_at`.
 
-Every dimension and fact table has two extra columns that do not exist in the handover:
+### `dim_purok`
 
-| Column | Type | Constraint | Purpose |
-| --- | --- | --- | --- |
-| `load_batch_id` | `VARCHAR(64)` | NOT NULL | The batch that last wrote this row (**batch ID column**). Used by post-load checks and for tracing. |
-| `loaded_at` | `TIMESTAMPTZ` | NOT NULL, default `now()` | When the row was last written |
+- **Table name and type:** `dim_purok` — dimension
+- **Purpose:** zones (puroks) used to group consumers and totals by area
+- **Important columns and data types:** `purok_key` `CHAR(16)`, `purok_no` `INTEGER`, `purok_label` `VARCHAR(50)`, `is_unknown` `BOOLEAN`
+- **Primary key or surrogate key:** `purok_key` (surrogate key from the Transformation Stage)
+- **Foreign keys and relationships:** none; referenced by `dim_consumer.purok_key`
+- **Constraints:** `purok_no` UNIQUE and NOT NULL; `purok_label` and `is_unknown` NOT NULL
+- **Indexes or partitions:** unique index on `purok_no`; no partitions
+- **Columns the load depends on:** match key `purok_no`; batch ID column `load_batch_id`; no history columns
+- **Reason for inclusion:** every per-purok report groups by this table
 
-Every row also keeps `transformation_run_id` from the handover, so a warehouse row can be traced back to its transformation run and, through `parent_run_id`, to its extraction run.
+### `dim_consumer`
 
-### 2.3 `dim_purok`
+- **Table name and type:** `dim_consumer` — dimension
+- **Purpose:** consumer identity, zone, and status
+- **Important columns and data types:** `consumer_key` `CHAR(16)`, `consumer_id` `INTEGER`, `full_name` `VARCHAR(152)`, `email` `VARCHAR(255)`, `purok_key` `CHAR(16)`, `status` `VARCHAR(10)`, `active_flag` `BOOLEAN`
+- **Primary key or surrogate key:** `consumer_key`
+- **Foreign keys and relationships:** `purok_key` → `dim_purok.purok_key`; referenced by all three fact tables
+- **Constraints:** `consumer_id` UNIQUE and NOT NULL; `status` CHECK in (`ACTIVE`, `INACTIVE`, `UNKNOWN`); `middle_name` and `contact_number` may be NULL
+- **Indexes or partitions:** unique index on `consumer_id`; index on `purok_key`
+- **Columns the load depends on:** match key `consumer_id`; batch ID column `load_batch_id`; history columns `valid_from`, `valid_to`, `is_current` are delivered by the Transformation Stage and loaded as received (SCD Type 1, so there is one row per consumer and `is_current` is always `TRUE`)
+- **Reason for inclusion:** shared dimension for consumption, billing, and payment analysis
 
-| Column | Type | Constraint | Notes |
-| --- | --- | --- | --- |
-| `purok_key` | `CHAR(16)` | PK | Surrogate key from Stage 2 |
-| `purok_no` | `INTEGER` | UNIQUE, NOT NULL | **Match key.** `0` = UNKNOWN zone |
-| `purok_label` | `VARCHAR(50)` | NOT NULL | Display name |
-| `is_unknown` | `BOOLEAN` | NOT NULL | `TRUE` for the UNKNOWN row |
+### `fact_consumption`
 
-**Reason for inclusion:** every per-purok total in dashboards groups by this table.
+- **Table name and type:** `fact_consumption` — fact
+- **Purpose:** one row per monthly meter reading per consumer
+- **Important columns and data types:** `consumption_key` `CHAR(16)`, `consumption_id` `INTEGER`, `consumer_key` `CHAR(16)`, `reading_date` `DATE`, `billing_period` `CHAR(7)`, `previous_reading`, `present_reading`, `consumption` `NUMERIC(12,2)`
+- **Primary key or surrogate key:** `consumption_key`
+- **Foreign keys and relationships:** `consumer_key` → `dim_consumer.consumer_key`; referenced by `fact_billing.consumption_key`
+- **Constraints:** `consumption_id` UNIQUE and NOT NULL; CHECK `consumption >= 0`; CHECK `present_reading >= previous_reading`
+- **Indexes or partitions:** indexes on `consumer_key`, `billing_period`, `load_batch_id`; no partitions at this volume
+- **Columns the load depends on:** match key `consumption_id`; batch ID column `load_batch_id`
+- **Reason for inclusion:** core fact for consumption analysis and demand forecasting
 
-### 2.4 `dim_consumer`
+### `fact_billing`
 
-| Column | Type | Constraint | Notes |
-| --- | --- | --- | --- |
-| `consumer_key` | `CHAR(16)` | PK | Surrogate key |
-| `consumer_id` | `INTEGER` | UNIQUE, NOT NULL | **Match key** (natural key from the source) |
-| `full_name`, `username`, `email` | `VARCHAR` | NOT NULL | Identity |
-| `middle_name`, `contact_number` | `VARCHAR` | NULL allowed | Optional |
-| `purok_key` | `CHAR(16)` | FK → `dim_purok.purok_key`, NOT NULL | Zone of the consumer |
-| `status` | `VARCHAR(10)` | NOT NULL, CHECK in (`ACTIVE`, `INACTIVE`, `UNKNOWN`) | Overwritten when it changes (SCD Type 1) |
-| `active_flag` | `BOOLEAN` | NOT NULL | Soft flag for inactive consumers |
-| `valid_from`, `valid_to`, `is_current` | `TIMESTAMPTZ`, `TIMESTAMPTZ`, `BOOLEAN` | `valid_from`, `is_current` NOT NULL | History columns delivered by Stage 2. Under SCD Type 1 there is one row per consumer and `is_current` is always `TRUE`. |
+- **Table name and type:** `fact_billing` — fact
+- **Purpose:** one row per bill, with balance and aging values
+- **Important columns and data types:** `billing_key` `CHAR(16)`, `billing_id` `INTEGER`, `consumption_key` `CHAR(16)`, `consumer_key` `CHAR(16)`, `billing_date`, `due_date` `DATE`, `total_bill`, `remaining_balance` `NUMERIC(12,2)`, `status` `VARCHAR(10)`, `days_overdue` `INTEGER`, `is_flagged_account` `BOOLEAN`
+- **Primary key or surrogate key:** `billing_key`
+- **Foreign keys and relationships:** `consumption_key` → `fact_consumption.consumption_key`; `consumer_key` → `dim_consumer.consumer_key`; referenced by `fact_payment.billing_key`
+- **Constraints:** `billing_id` UNIQUE and NOT NULL; CHECK `total_bill >= 0`; CHECK `remaining_balance >= 0`; `status` CHECK in (`PAID`, `PARTIAL`, `UNPAID`, `UNKNOWN`)
+- **Indexes or partitions:** indexes on `(consumer_key, status, due_date)`, `billing_period`, `load_batch_id`
+- **Columns the load depends on:** match key `billing_id`; batch ID column `load_batch_id`
+- **Reason for inclusion:** billing history, outstanding balances, and flagged-account reporting
 
-**Index:** `purok_key`. **Reason for inclusion:** conformed dimension shared by all three fact tables.
+### `fact_payment`
 
-### 2.5 `fact_consumption`
+- **Table name and type:** `fact_payment` — fact
+- **Purpose:** one row per payment transaction
+- **Important columns and data types:** `payment_key` `CHAR(16)`, `payment_id` `INTEGER`, `billing_key` `CHAR(16)`, `payment_date` `DATE`, `payment_method` `VARCHAR(20)`, `total_paid`, `amount_tendered` `NUMERIC(12,2)`
+- **Primary key or surrogate key:** `payment_key`
+- **Foreign keys and relationships:** `billing_key` → `fact_billing.billing_key`
+- **Constraints:** `payment_id` UNIQUE and NOT NULL; CHECK `total_paid >= 0`; `payment_method` CHECK in (`CASH`, `GCASH`, `BANK_TRANSFER`, `OTHER`); `reference_number` and `collection_rate` may be NULL
+- **Indexes or partitions:** indexes on `(billing_key, payment_date)`, `load_batch_id`
+- **Columns the load depends on:** match key `payment_id`; batch ID column `load_batch_id`
+- **Reason for inclusion:** collection monitoring and revenue reporting
 
-| Column | Type | Constraint | Notes |
-| --- | --- | --- | --- |
-| `consumption_key` | `CHAR(16)` | PK | Surrogate key |
-| `consumption_id` | `INTEGER` | UNIQUE, NOT NULL | **Match key** |
-| `consumer_key` | `CHAR(16)` | FK → `dim_consumer`, NOT NULL | Owner of the reading |
-| `reading_date`, `billing_period` | `DATE`, `CHAR(7)` | NOT NULL | Reading date and `YYYY-MM` period |
-| `previous_reading`, `present_reading` | `NUMERIC(12,2)` | NOT NULL, CHECK `present_reading >= previous_reading` | Meter values |
-| `consumption` | `NUMERIC(12,2)` | NOT NULL, CHECK `>= 0` | Cubic meters; used in the aggregate check |
+### `load_log`
 
-**Indexes:** `consumer_key`, `billing_period`, `load_batch_id`. **Reason for inclusion:** core fact for consumption analysis and forecasting.
-
-### 2.6 `fact_billing`
-
-| Column | Type | Constraint | Notes |
-| --- | --- | --- | --- |
-| `billing_key` | `CHAR(16)` | PK | Surrogate key |
-| `billing_id` | `INTEGER` | UNIQUE, NOT NULL | **Match key** |
-| `consumption_key` | `CHAR(16)` | FK → `fact_consumption`, NOT NULL | Reading that was billed |
-| `consumer_key` | `CHAR(16)` | FK → `dim_consumer`, NOT NULL | Billed consumer |
-| `billing_date`, `due_date`, `billing_period` | `DATE`, `DATE`, `CHAR(7)` | NOT NULL | Dates |
-| `total_bill` | `NUMERIC(12,2)` | NOT NULL, CHECK `>= 0` | Used in the aggregate check |
-| `remaining_balance` | `NUMERIC(12,2)` | NOT NULL, CHECK `>= 0` | Outstanding amount |
-| `status` | `VARCHAR(10)` | NOT NULL, CHECK in (`PAID`, `PARTIAL`, `UNPAID`, `UNKNOWN`) | Bill status |
-| `days_overdue`, `overdue_bucket`, `outstanding_bill_count`, `is_flagged_account` | — | NOT NULL | Aging values computed by Stage 2 for the batch reference date; overwritten by each batch |
-
-**Indexes:** `(consumer_key, status, due_date)`, `billing_period`, `load_batch_id`. **Reason for inclusion:** billing history, balances, and flagged-account reporting.
-
-### 2.7 `fact_payment`
-
-| Column | Type | Constraint | Notes |
-| --- | --- | --- | --- |
-| `payment_key` | `CHAR(16)` | PK | Surrogate key |
-| `payment_id` | `INTEGER` | UNIQUE, NOT NULL | **Match key** |
-| `billing_key` | `CHAR(16)` | FK → `fact_billing`, NOT NULL | Bill that was paid |
-| `payment_date` | `DATE` | NOT NULL | Date of payment |
-| `payment_method` | `VARCHAR(20)` | NOT NULL, CHECK in (`CASH`, `GCASH`, `BANK_TRANSFER`, `OTHER`) | Method code |
-| `total_paid` | `NUMERIC(12,2)` | NOT NULL, CHECK `>= 0` | Used in the aggregate check |
-| `reference_number`, `collection_rate` | `VARCHAR(100)`, `NUMERIC(9,4)` | NULL allowed | Optional |
-
-**Indexes:** `(billing_key, payment_date)`, `load_batch_id`. **Reason for inclusion:** collection monitoring and revenue reporting.
-
-### 2.8 `load_log`
-
-Append-only audit table with one row per target table per load run. Fields are defined in Section 6. **Indexes:** `(batch_id, status)` for the duplicate-batch check, `run_id`.
-
-A view, `warehouse.latest_successful_load`, shows the most recent approved batch per table so dashboards can display "data as of".
+- **Table name and type:** `load_log` — log
+- **Purpose:** one row per target table per load run (fields in Section 6)
+- **Important columns and data types:** `run_id`, `transformation_run_id`, `batch_id` `VARCHAR(64)`, `table_name` `VARCHAR(40)`, `status` `VARCHAR(20)`, record counts `INTEGER`, timestamps `TIMESTAMPTZ`
+- **Primary key or surrogate key:** `load_log_id` (generated)
+- **Foreign keys and relationships:** none
+- **Constraints:** `run_id`, `batch_id`, `table_name`, `status` NOT NULL; rows are only inserted, never updated or deleted by the load role
+- **Indexes or partitions:** indexes on `(batch_id, status)` and `run_id`
+- **Columns the load depends on:** `batch_id` and `status`, used by the duplicate batch check
+- **Reason for inclusion:** monitoring, auditing, lineage, and recovery of every batch
 
 ---
 
 ## 3. Load Strategy and Rules
 
-### 3.1 Strategy per Table
+- **Load Type**
+  - All five dimension and fact tables use an **incremental load**: records are matched on a defined key, new records are inserted and changed records are updated. No table is truncated, so dashboards never see an empty table and a failed load cannot remove existing data.
+  - `load_log` is append-only.
+- **Write Logic**
+  - **Upsert** (insert new, update existing) for all five tables.
+  - Match key used to detect existing records: `purok_no`, `consumer_id`, `consumption_id`, `billing_id`, `payment_id` (the natural key of each table).
+  - Rows that would violate a target constraint (wrong type, NULL in a required column, failed CHECK, or missing parent record) are not written. They are counted as rejected and saved to the rejected-records file (Section 7).
+- **Handling of Changing Data**
+  - **Overwrite (SCD Type 1)** for both dimensions and for changed fact values such as bill status, balances, and aging values. History (SCD Type 2) is not kept because the source system stores no status history (`docs/transformation.md` §5.4).
+  - **Deleted or inactive records:** inactive consumers arrive with `status = INACTIVE` and `active_flag = FALSE` and stay in the warehouse (soft delete flag). A record missing from a later batch is kept, never hard-deleted.
+  - **Late-arriving records:** every batch is a full snapshot, so a late reading or payment appears in a later batch and is inserted by the upsert.
+  - **Handover whose schema differs from the target:** the batch is rejected by the pre-load schema check (Section 4) and nothing is written.
+- **Load Order and Dependencies**
+  - Parent tables are loaded before child tables: `dim_purok` → `dim_consumer` → `fact_consumption` → `fact_billing` → `fact_payment`.
+  - **Facts with no matching dimension record are rejected.** The Transformation Stage already guarantees matching keys, so an orphan at load time means the handover is damaged. The only "Unknown" member is the UNKNOWN purok (`purok_no = 0`), which arrives as a normal `dim_purok` row.
+- **Transaction and Rollback Handling**
+  - The **whole batch** (all five tables and the post-load checks) is loaded in **one transaction**.
+  - The transaction is committed only when the batch is accepted (Section 8). Otherwise it is rolled back, so the warehouse is left exactly as it was before the run and no partial data remains. If the process or connection dies, PostgreSQL discards the open transaction.
+  - `load_log` rows are written on a separate connection, so failed runs are still recorded.
+- **Rerun and Idempotency**
+  - Running the same batch twice does not create duplicates or inflate totals, because the upsert matches on the natural key and writes the same values to the same rows.
+  - Reruns and recovery: a failed batch left nothing behind, so it is fixed and run again (merge on key). The duplicate batch check stops a batch that already succeeded; an intentional reload uses `--force-reload`.
 
-| Table | Load Type | Write Logic | Match Key | Changing Data | On Failure |
-| --- | --- | --- | --- | --- | --- |
-| `dim_purok` | Incremental | Upsert | `purok_no` | Overwrite (SCD Type 1) | Roll back whole batch, stop |
-| `dim_consumer` | Incremental | Upsert | `consumer_id` | Overwrite (SCD Type 1) | Roll back whole batch, stop |
-| `fact_consumption` | Incremental | Upsert | `consumption_id` | Overwrite with latest values | Roll back whole batch, stop |
-| `fact_billing` | Incremental | Upsert | `billing_id` | Overwrite with latest values | Roll back whole batch, stop |
-| `fact_payment` | Incremental | Upsert | `payment_id` | Overwrite with latest values | Roll back whole batch, stop |
-| `load_log` | Append | Insert only | — | Never changed | Written in its own transaction |
-
-**Why incremental upsert and not truncate-and-reload:** the handover is a full snapshot, but a truncate would leave the tables empty for dashboards if the load failed midway, and it would delete warehouse rows whose source record was later quarantined. Upsert inserts new records, updates existing ones, and never removes history.
-
-### 3.2 Write Logic
-
-For each table, in load order:
-
-1. Create a temporary staging table and bulk-insert the CSV rows into it.
-2. Validate the staged rows against the target constraints (types, NOT NULL, CHECK, foreign key exists in the target). Rows that fail are **rejected**: they are not written, they are saved to the load quarantine (Section 7.2), and they are counted in `records_rejected`.
-3. Merge the remaining rows into the target with `INSERT ... ON CONFLICT (<match key>) DO UPDATE`, setting `load_batch_id` and `loaded_at`.
-4. Count the rows inserted and the rows updated.
-
-### 3.3 Handling of Changing Data
-
-| Case | Handling |
-| --- | --- |
-| **Changed attributes** (consumer status, bill status, balances, aging values) | **SCD Type 1 — overwrite.** The source keeps no status history, so there is nothing to build Type 2 history from (`docs/transformation.md` §5.4, D-06). |
-| **Deleted or inactive records** | Inactive consumers arrive with `status = INACTIVE` and `active_flag = FALSE` and stay in the warehouse (soft delete). A record that is missing from a later batch is **kept**, never hard-deleted; it is recognizable by an older `load_batch_id`. The count of such rows is written to the load log. |
-| **Late-arriving records** | Because every batch is a full snapshot, a late reading or payment simply appears in a later batch and is inserted by the upsert. No special path is needed. |
-| **Handover schema differs from the target** | **Reject the batch.** The pre-load schema check (Section 4) compares the handover columns with the target tables; any difference is a critical failure and nothing is written. The data contract is then updated in both stages and the batch is rerun. |
-
-### 3.4 Load Order and Dependencies
-
-- Dimensions are loaded before facts, and each fact after the fact it references (order in Section 1.4).
-- **Facts with no matching parent record are rejected**, not attached to an "Unknown" member. Stage 2 already guarantees referential integrity (its check V-06), so an orphan at load time means the handover is damaged. Rejected rows are counted and make the batch fail or go to review (Section 8).
-- The only "Unknown" member is the UNKNOWN purok (`purok_no = 0`), which Stage 2 delivers as a normal `dim_purok` row.
-
-### 3.5 Transaction and Rollback Handling
-
-- **The whole batch — all five tables and the post-load checks — runs in one database transaction.**
-- The transaction is committed only when the acceptance decision is APPROVED (Section 8). In every other case it is rolled back, so the warehouse is left exactly as it was before the run. No partial data can remain.
-- If the process or the connection dies midway, PostgreSQL discards the open transaction automatically.
-- `load_log` rows are written on a **separate connection** after the decision, so failed and rolled-back runs are still recorded. If the warehouse cannot be reached at all, the log is still written to the JSON log files (Section 7.1).
-
-### 3.6 Rerun and Idempotency
-
-- Running the same batch twice cannot create duplicates or inflate totals: the upsert matches on the natural key, so the second run updates the same rows with the same values.
-- The pre-load duplicate-batch check stops a batch that was already loaded successfully. An intentional reload uses `--force-reload`, which is safe for the reason above.
-- **Recovery of a failed batch:** fix the cause and run the same batch again (`python -m pipeline.load --run-date <date>`). A failed run left nothing behind, so the rerun starts from a clean state.
+| Table | Load Type | Write Logic | Match Key | On Failure |
+| --- | --- | --- | --- | --- |
+| `dim_purok` | Incremental | Upsert (SCD Type 1) | `purok_no` | Roll back batch, stop |
+| `dim_consumer` | Incremental | Upsert (SCD Type 1) | `consumer_id` | Roll back batch, stop |
+| `fact_consumption` | Incremental | Upsert | `consumption_id` | Roll back batch, stop |
+| `fact_billing` | Incremental | Upsert | `billing_id` | Roll back batch, stop |
+| `fact_payment` | Incremental | Upsert | `payment_id` | Roll back batch, stop |
 
 ---
 
 ## 4. Pre-Load Validation Checks
 
-These checks run before any data is written. A critical failure stops the load; nothing is written to the dimension or fact tables.
+These checks are performed before data is written to the target. A critical failure stops the load.
 
-| ID | Check Name | Target | Purpose | Validation Criteria | Severity |
-| --- | --- | --- | --- | --- | --- |
-| PRE-01 | Target connection | Warehouse database | Ensure the load can start | PASS: connection succeeds within 10 seconds (after up to 3 attempts). FAIL: otherwise | Critical |
-| PRE-02 | Write permission | `warehouse` schema, role `etl_loader` | Avoid failing halfway for missing privileges | PASS: role has `INSERT` and `UPDATE` on all five tables and `INSERT` on `load_log`. FAIL: any privilege missing | Critical |
-| PRE-03 | Handover completeness | `transformed/<table>/<run_date>/` | Make sure the whole batch arrived | PASS: CSV, `.schema.json`, and transformation log exist for all five tables. FAIL: any file missing | Critical |
-| PRE-04 | Handover status | Transformation logs | Load approved data only | PASS: `transformation_status = APPROVED` for all tables, or the batch was released by a named reviewer (`--handover-released-by`). FAIL: `REJECTED`, or `MANUAL REVIEW` without a release | Critical |
-| PRE-05 | Schema match | All target tables vs. `.schema.json` | Prevent type and column errors | PASS: every handover column exists in the target table and every target NOT NULL column is in the handover. FAIL: any missing or extra column | Critical |
-| PRE-06 | Record count | CSV row count vs. `records_output` | Detect a truncated or changed file | PASS: counts are equal for every table. FAIL: any difference | Critical |
-| PRE-07 | File integrity | CSV SHA-256 vs. `output_checksums` | Prove the files are the ones Stage 2 validated | PASS: checksums are equal for every table. FAIL: any difference | Critical |
-| PRE-08 | Duplicate batch | `load_log (batch_id, transformation_run_id)` | Avoid loading the same batch twice | PASS: no earlier `SUCCESS` for this batch and transformation run, or `--force-reload` is given. FAIL: already loaded | Critical |
-| PRE-09 | Storage space | `pg_database_size()` vs. the 500 MB plan limit | Avoid running out of space mid-load | PASS: below 80% used. WARNING: 80% to 95%. FAIL: above 95% | Critical above 95%; Non-critical from 80% |
-| PRE-10 | Batch not empty | CSV row counts | Avoid "successfully" loading nothing | PASS: `dim_consumer` and `dim_purok` have at least 1 row. FAIL: 0 rows | Critical |
-
-Note on PRE-04: the transformation writes its CSV files even when it rejects a batch, so the existence of the files proves nothing. The status in the log is what counts.
+| Check Name | Target | Purpose | Validation Criteria | Severity |
+| --- | --- | --- | --- | --- |
+| Target connection | Warehouse database | Ensure the load can start | Connection succeeds within 10 seconds (up to 3 attempts) | Critical |
+| Write permission | `warehouse` schema, role `etl_loader` | Avoid failing midway for missing privileges | Role can `INSERT` and `UPDATE` all five tables and `INSERT` into `load_log` | Critical |
+| Handover completeness | `transformed/<table>/<run_date>/` | Make sure the whole batch arrived | CSV, `.schema.json`, and transformation log exist for all five tables | Critical |
+| Handover status | Transformation metadata | Load approved data only | Status = APPROVED for all tables (a batch on MANUAL REVIEW must first be released by a named reviewer) | Critical |
+| Schema match | All target tables | Prevent type or column errors | All handover columns exist in the target with expected types; no missing or extra columns | Critical |
+| Record count | Handover CSV files | Detect a truncated or changed file | Row count of each CSV = `records_output` in the transformation log | Critical |
+| File integrity | Handover CSV files | Prove the files are the ones the transformation validated | SHA-256 of each CSV = checksum in the transformation log | Critical |
+| Duplicate batch | `load_log.batch_id` | Avoid loading twice | Batch ID not previously loaded with SUCCESS | Critical |
+| Storage space | Warehouse database size | Avoid running out of space | Used space is below 95% of the 500 MB limit | Critical |
+| Storage warning | Warehouse database size | Give early notice before space runs out | Used space is below 80% of the 500 MB limit | Non-critical |
 
 ---
 
 ## 5. Post-Load Validation and Reconciliation
 
-These checks run **inside the load transaction**, after all five tables are written and before the commit, so a critical failure can still roll everything back.
+These checks are performed after loading, inside the same transaction, so a critical failure can still be rolled back.
 
-| ID | Check Name | Target | Purpose | Validation Criteria | Severity |
-| --- | --- | --- | --- | --- | --- |
-| POST-01 | Record reconciliation | All target tables | Detect lost or extra records | PASS: `records_received = records_inserted + records_updated + records_rejected` for every table. FAIL: any difference | Critical |
-| POST-02 | Batch row count | Rows with this `load_batch_id` | Confirm the rows are really in the target | PASS: count in target = `records_received - records_rejected` for every table. FAIL: any difference | Critical |
-| POST-03 | Key uniqueness | Primary key and natural key of every table | Prevent duplicates | PASS: duplicate count = 0. FAIL: more than 0 | Critical |
-| POST-04 | Referential integrity | `dim_consumer.purok_key`, `fact_consumption.consumer_key`, `fact_billing.consumption_key`, `fact_billing.consumer_key`, `fact_payment.billing_key` | Prevent orphan rows | PASS: 100% of keys match the parent table. FAIL: any orphan | Critical |
-| POST-05 | Required columns | NOT NULL columns of the contract | Data completeness | PASS: 0 NULLs. FAIL: more than 0 | Critical |
-| POST-06 | Amount reconciliation | `SUM(consumption)`, `SUM(total_bill)`, `SUM(total_paid)` | Confirm no value was lost or changed | PASS: sum in the CSV (minus rejected rows) = sum in the target for this batch, within 0.01. FAIL: otherwise | Critical |
-| POST-07 | Rejected records | `records_rejected` per table | Decide acceptance | PASS: 0 rejected. WARNING: more than 0 and at most 1.0% of the table. FAIL: more than 1.0% | Critical above 1.0%; Non-critical up to 1.0% |
-| POST-08 | Optional column null rate | `dim_consumer.middle_name`, `dim_consumer.contact_number`, `fact_payment.reference_number` | Watch data completeness over time | PASS: null rate at most 90%. WARNING: above 90% | Non-critical |
-| POST-09 | Load duration | Whole run | Keep the load inside its time window | PASS: at most 15 minutes. WARNING: longer | Non-critical |
-| POST-10 | Load errors or interruptions | Load process | Catch database errors and crashes | PASS: no exception. FAIL: any database error, timeout, or interruption (transaction is rolled back) | Critical |
+| Check Name | Target | Purpose | Validation Criteria | Severity |
+| --- | --- | --- | --- | --- |
+| Record reconciliation | All target tables | Detect lost or extra records | received = loaded + rejected, where loaded = inserted + updated | Critical |
+| Batch row count | Rows with this `load_batch_id` | Confirm the rows are in the target | Row count in target = received − rejected | Critical |
+| Key uniqueness | Primary key and match key of each table | Prevent duplicates | Duplicate count = 0 | Critical |
+| Referential integrity | `dim_consumer.purok_key`, `fact_consumption.consumer_key`, `fact_billing.consumption_key`, `fact_billing.consumer_key`, `fact_payment.billing_key` | Prevent orphan facts | 100% match in the parent table | Critical |
+| Required columns | NOT NULL columns of each table | Data completeness | Null count = 0 | Critical |
+| Amount reconciliation | `fact_consumption.consumption`, `fact_billing.total_bill`, `fact_payment.total_paid` | Confirm no value loss | Source sum = target sum for the batch (within 0.01) | Critical |
+| Rejected records | All target tables | Limit records not loaded | Rejected records are 1% or less of each table | Critical |
+| Rejected records warning | All target tables | Bring any rejected record to review | Rejected count = 0 | Non-critical |
+| Load errors | Load process | Detect errors and interruptions | No database error, constraint violation, timeout, or interruption | Critical |
+| Null check | `dim_consumer.contact_number`, `dim_consumer.middle_name`, `fact_payment.reference_number` | Data completeness | Null rate is 90% or less | Non-critical |
+| Load duration | Whole load run | Keep the load inside its time window | Load finishes within 15 minutes | Non-critical |
 
-In POST-01, *rejected* means rows the load did not write (Section 3.2, step 2). Rows removed earlier by the Transformation Stage are not counted here; they belong to the Stage 2 reconciliation.
+*Rejected* means records the load did not write, such as constraint violations. Records already removed during transformation are not counted.
 
-> **Scope limitation:** this stage performs no cleaning and no business transformation. A problem found here is reported and handled by the rules in Section 8; the fix is made in the stage that caused it.
+**Scope limitation:** No new cleaning or business transformation is performed here. Issues found are reported and handled using the rules in Section 8.
 
 ---
 
 ## 6. Load Metadata and Log Specification
 
-One record is written per target table per load run, to `warehouse.load_log` and to a JSON file (Section 7.1).
+One record is written per target table per load run.
 
 | Field | Purpose | Example |
 | --- | --- | --- |
-| `run_id` | Unique ID of the load run | `ww-load-2026-03-10-0300-a1b2c3` |
+| `run_id` | Unique ID of the pipeline run | `ww-load-2026-03-10-0300-a1b2c3` |
 | `transformation_run_id` | Link to the transformation run | `ww-transform-2026-03-10-0200-7b3e42` |
 | `batch_id` | Batch being loaded | `ww-batch-2026-03-10` |
-| `batch_window_start`, `batch_window_end` | Date range covered by the batch | `2026-03-10T00:00:00+08:00` to `2026-03-10T23:59:59+08:00` |
+| `batch_window` | Date range covered by the batch | `2026-03-10 to 2026-03-10` |
 | `table_name` | Target table | `fact_billing` |
 | `load_type` | Full or incremental load | `INCREMENTAL` |
-| `load_start_ts` | When the table load started | `2026-03-10T03:00:04+08:00` |
-| `load_end_ts` | When the table load ended | `2026-03-10T03:00:19+08:00` |
+| `load_start_ts` | When the table load started | `2026-03-10 03:00:04` |
+| `load_end_ts` | When the table load ended | `2026-03-10 03:00:19` |
 | `load_duration_sec` | Time taken to load the table | `15` |
-| `records_received` | Rows received from transformation | `12395` |
+| `records_received` | Rows received from transformation | `12,395` |
 | `records_inserted` | New rows written | `210` |
-| `records_updated` | Existing rows overwritten | `12185` |
-| `records_rejected` | Rows the load did not write | `0` |
-| `status` | Result for this table | `SUCCESS` / `WARNING` / `FAILED` / `ROLLED_BACK` |
-| `decision` | Overall batch decision (Section 8) | `APPROVED` / `MANUAL REVIEW` / `REJECTED` |
-| `pre_load_result` | Outcome of the pre-load checks | `PASS` or `FAIL: PRE-07` |
-| `post_load_result` | Outcome of the post-load checks | `PASS` or `WARNING: POST-08` |
-| `error_code` | Failure or rejection reason, if any | `NULL` / `PRE04_HANDOVER_NOT_APPROVED` / `DB_CONNECTION` |
-| `error_message` | Error detail, without credentials | `NULL` |
+| `records_updated` | Existing rows changed | `12,185` |
+| `records_rejected` | Rows that failed to load | `0` |
+| `status` | Result of the load | `SUCCESS` |
+| `pre_load_result` | Outcome of the pre-load checks | `PASS` |
+| `post_load_result` | Outcome of the post-load checks | `PASS` |
+| `error_code` | Failure or rejection reason, if any | `NULL` |
+| `error_message` | Error detail, if any | `NULL` |
 | `reviewed_by` | Reviewer who released a held batch, if any | `NULL` |
-| `source_file`, `source_checksum` | Handover file that was loaded | `transformed/fact_billing/2026-03-10/fact_billing_2026-03-10.csv`, `9f2c…` |
-| `load_code_version` | Version of the load code | `1.0` |
+| `load_code_version` | Version of the load code | `v1.0` |
 
-`status = ROLLED_BACK` marks a table that loaded correctly but was undone because another table or check failed.
+How the metadata and logs are used:
 
-**Example log record (JSON):**
-
-```json
-{
-  "run_id": "ww-load-2026-03-10-0300-a1b2c3",
-  "transformation_run_id": "ww-transform-2026-03-10-0200-7b3e42",
-  "batch_id": "ww-batch-2026-03-10",
-  "batch_window_start": "2026-03-10T00:00:00+08:00",
-  "batch_window_end": "2026-03-10T23:59:59+08:00",
-  "table_name": "fact_billing",
-  "load_type": "INCREMENTAL",
-  "load_start_ts": "2026-03-10T03:00:04+08:00",
-  "load_end_ts": "2026-03-10T03:00:19+08:00",
-  "load_duration_sec": 15,
-  "records_received": 12395,
-  "records_inserted": 210,
-  "records_updated": 12185,
-  "records_rejected": 0,
-  "status": "SUCCESS",
-  "decision": "APPROVED",
-  "pre_load_result": "PASS",
-  "post_load_result": "PASS",
-  "error_code": null,
-  "error_message": null,
-  "reviewed_by": null,
-  "source_file": "transformed/fact_billing/2026-03-10/fact_billing_2026-03-10.csv",
-  "source_checksum": "9f2c4a1d8b7e6f5a3c2d1b0e9f8a7b6c",
-  "load_code_version": "1.0"
-}
-```
-
-**How the metadata and logs are used:**
-
-- **Monitoring:** the Airflow UI shows each run as success or failure; `load_log` shows status, counts, and duration per table, and `load_duration_sec` shows when loads are getting slower.
-- **Troubleshooting:** `pre_load_result`, `post_load_result`, and `error_code` name the exact check that failed; the counts show which table lost or rejected rows.
-- **Auditing:** `run_id`, `batch_id`, `source_checksum`, and `load_code_version` prove which file was loaded, when, and by which code version. `reviewed_by` records who released a held batch.
-- **Data lineage:** warehouse row → `load_batch_id` → `load_log` → `transformation_run_id` → Stage 2 log → `parent_run_id` → Stage 1 log → source table.
-- **Recovery of a failed batch:** a `FAILED` or `ROLLED_BACK` record means nothing was committed, so the same `batch_id` can be rerun after the fix. The last `SUCCESS` record shows which batch the warehouse currently holds.
+- **Monitoring:** the Airflow UI shows each run as success or failure; `status`, the record counts, and `load_duration_sec` show the result and speed of each table load.
+- **Troubleshooting:** `pre_load_result`, `post_load_result`, and `error_code` name the check that failed; the record counts show which table lost or rejected rows.
+- **Auditing:** `run_id`, `batch_id`, `load_start_ts`, and `load_code_version` prove what was loaded, when, and by which version of the code; `reviewed_by` records who released a held batch.
+- **Data lineage:** each warehouse row carries `load_batch_id` and `transformation_run_id`, which link it to its load record, then to the transformation run, and from there to the extraction run.
+- **Recovery of a failed batch:** a failed record means nothing was committed, so the same `batch_id` is run again after the fix. The latest `SUCCESS` record shows which batch the warehouse currently holds.
 
 ---
 
 ## 7. Log Retention, Rejected Data, and Access
 
-### 7.1 Load Logs
+- **Log retention period and justification:** operational logs are kept for a minimum of 90 days; audit records are kept for a minimum of 1 year. These are the same periods as the Extraction and Transformation stages, so a batch can be traced through all three stages. One year covers a full cycle of monthly billing and the flagged-account rule (3 or more outstanding bills).
+- **Storage location of logs:** operational logs are JSON files in `logs/waterwise-load/<YYYY-MM-DD>/<run_id>_<table>.json`, together with the Airflow task log. Audit records are the rows of `warehouse.load_log`.
+- **Location and retention of records rejected during loading:** `quarantine/load/<run_date>/rejected.csv`, with the run ID, batch ID, table, reject reason, and the values needed to diagnose the row (email and contact number masked). Retained for a minimum of 1 year, because a rejected bill or payment is a financial record.
+- **Access permissions:**
+  - Read: data engineer and Super Admin (logs, `load_log`, rejected records); dashboards read `load_log` only.
+  - Write: the load process only (`etl_loader` role and the Airflow worker), and only by appending.
+  - Delete: data engineer, after the retention period and with Super Admin approval. The load role cannot delete.
+  - Consumers, meter readers, and billing staff have no access.
+- **Archiving requirements:** JSON logs older than 90 days are compressed and moved to cold storage. `load_log` rows stay online for 1 year.
+- **Deletion rules and the responsible process:** nothing is deleted before its retention period ends. After that, the data engineer deletes expired logs and rejected records with approval, and the deletion is recorded.
+- **Backup or snapshot of the target before major loads:** daily loads need no snapshot, because the single transaction protects the warehouse and it can be rebuilt by reloading a handover. Before a major load (schema change, forced reload, or backfill of old batches), the data engineer takes a `pg_dump` of the `warehouse` schema, because the Supabase free plan has no automatic backups.
 
-| Item | Policy |
-| --- | --- |
-| **Operational logs** | JSON files in `logs/waterwise-load/<YYYY-MM-DD>/<run_id>_<table>.json`, plus the Airflow task log. Retained for a minimum of **90 days**. |
-| **Audit records** | Rows in `warehouse.load_log`. Retained for a minimum of **1 year**. |
-| **Justification** | Same periods as Stages 1 and 2, so a batch can be traced through all three stages for as long as any one of them keeps its record. One year covers a full cycle of monthly billing and the flagged-account rule (3 or more outstanding bills). |
-| **Archiving** | JSON logs older than 90 days are compressed and moved to cold storage. `load_log` rows stay online for 1 year. |
-| **Deletion rules** | Nothing is deleted before its retention period ends, or while it is needed for troubleshooting, auditing, or recovery. Deletion after that is done by the data engineer, with approval, and is itself recorded. |
+**Requirement:** Logs and rejected records are not deleted before the defined retention period or while they are needed for troubleshooting, auditing, or recovery.
 
-### 7.2 Rejected Records
-
-| Item | Policy |
-| --- | --- |
-| **Location** | `quarantine/load/<run_date>/rejected.csv` |
-| **Content** | `run_id`, `batch_id`, `table_name`, `reject_reason` (for example `FK_NOT_FOUND: billing_key`), the key of the row, and the values needed to diagnose it. Email and contact number are masked. |
-| **Retention** | Minimum **1 year**, because a rejected bill or payment is a financial record whose rejection may need to be explained later. |
-| **Reprocessing** | Rejected rows are never loaded by hand. The cause is fixed in the stage that produced it and the batch is rerun. |
-
-### 7.3 Access Permissions
-
-| Who | Read | Write | Delete |
-| --- | --- | --- | --- |
-| Data engineer | Logs, `load_log`, quarantine | — | After retention, with approval |
-| Super Admin | Logs, `load_log`, quarantine | — | Approves deletion |
-| Load process (`etl_loader`, Airflow worker) | `load_log` | Appends logs and quarantine files | Never |
-| Dashboards (`warehouse_reader`) | `load_log` and the `latest_successful_load` view | — | Never |
-| Consumers, meter readers, billing staff | No access | — | — |
-
-### 7.4 Backup Before Major Loads
-
-- **Daily loads** need no snapshot: the single transaction protects the warehouse, and the warehouse can be rebuilt at any time by reloading a transformation handover.
-- **Major loads** — a schema change, a `--force-reload`, or a backfill of old batches — require the data engineer to take a `pg_dump` of the `warehouse` schema first, because the Supabase free plan has no automatic backups. The dump is kept until the load has been verified.
+Operational logs (JSON files, 90 days) are kept separately from audit records (`load_log` rows and rejected records, 1 year).
 
 ---
 
 ## 8. Load Acceptance, Rollback, and Completion Rules
 
-### 8.1 Decision Rules
+- **Automatic Approval**
+  - **Validation condition:** all pre-load checks (Section 4) and post-load checks (Section 5).
+  - **Acceptance criteria:** all critical checks pass, reconciliation matches, and there are no warnings.
+  - **Pipeline action:** commit the transaction, mark the batch complete, publish the data.
+  - **Decision:** automatic.
+- **Manual Review**
+  - **Validation condition:** the non-critical checks — storage warning, rejected records warning, null check, load duration.
+  - **Acceptance criteria:** no critical check fails, but one or more non-critical checks give a warning, for example a small number of rejected records within the 1% tolerance.
+  - **Pipeline action:** hold publication — the transaction is rolled back so nothing is published — and notify the owner. After review, the batch is run again with `--accept-warnings "<reviewer>"`, which commits it and records the reviewer.
+  - **Decision:** manual. **Responsible:** data engineer / Super Admin.
+- **Rejection or Failure**
+  - **Validation condition:** any critical check.
+  - **Acceptance criteria:** the batch fails when the handover is not approved, the schema does not match, counts or checksums differ, the batch was already loaded, reconciliation or amounts do not match, duplicate or orphan keys exist, a required column is NULL, more than 1% of records are rejected, or a database error occurs.
+  - **Pipeline action:** roll back, then:
+    - connection or network errors: **retry** automatically, up to **3 retries** with a **5-minute wait** between retries;
+    - data or contract failures: **stop** without retrying, because a retry would fail the same way. The batch is run again after the cause is fixed.
+  - **Decision:** automatic.
+  - **Who is notified:** the data engineer, through the failed Airflow task (Airflow UI, and email when configured). The Super Admin is informed when published data will be more than one day late.
+- **Completion and Handover**
+  - **What is reported:** final status, run ID, batch ID, and transformation run ID; records received, inserted, updated, and rejected per table; and the data now available to users (the five `warehouse` tables, current as of the batch window).
+  - **How downstream users are notified:** the view `warehouse.latest_successful_load` shows the latest approved batch and its load time, and dashboards display it as "data as of". A held or rejected batch never appears there, so users keep seeing the previous complete batch.
 
-| Overall Condition | Acceptance Decision | Pipeline Action | Decision | Responsible |
-| --- | --- | --- | --- | --- |
-| All pre-load and post-load checks PASS | **APPROVED** | Commit the transaction, write `load_log` as `SUCCESS`, report completion | Automatic | — |
-| No critical FAIL, one or more non-critical WARNING | **MANUAL REVIEW** | Roll back (nothing is published), write `load_log`, notify the owner. After review the batch is rerun with `--accept-warnings "<reviewer>"` and then committed | Manual | Data engineer / Super Admin |
-| One or more critical FAIL | **REJECTED** | Roll back, write `load_log` as `FAILED`, stop | Automatic | Data engineer investigates |
+**Decision Rules**
 
-### 8.2 Rules in Detail
-
-| Rule | Validation condition | Acceptance criteria | Pipeline action |
-| --- | --- | --- | --- |
-| **Automatic approval** | PRE-01 to PRE-10 and POST-01 to POST-10 | Every check PASS: handover approved, counts and sums reconcile, 0 rejected rows | Commit and mark the batch complete |
-| **Manual review** | PRE-09, POST-07, POST-08, POST-09 | A warning only: storage at 80–95%, rejected rows at most 1.0% of a table, optional-column null rate above 90%, or run longer than 15 minutes | Hold: roll back and wait for the reviewer. The reviewer checks the log and the quarantine file, then either reruns with `--accept-warnings` (recorded in `reviewed_by`) or leaves the batch rejected |
-| **Rejection or failure** | Any critical check | Handover not approved, schema mismatch, count or checksum mismatch, duplicate batch, reconciliation or sum mismatch, duplicate keys, orphans, NULL in a required column, more than 1.0% rejected, or a database error | Roll back and stop |
-
-**Retries:**
-
-- **Connection or network errors** (warehouse unreachable, timeout, dropped connection): the task is retried automatically, **up to 3 retries, 5 minutes apart**. A retry is safe because the failed attempt was rolled back.
-- **Data or contract failures** (any other critical FAIL): **not retried**, because running again would fail the same way. The pipeline stops until the cause is fixed and the batch is rerun.
-
-**Notification on failure or rejection:** the Airflow task is marked failed, which alerts the **data engineer** (Airflow UI, and email when SMTP is configured). The run summary and the `load_log` record name the failed check. The Super Admin is informed when published data will be more than one day late.
-
-### 8.3 Completion and Handover
-
-When a batch completes, the load reports:
-
-- the final decision and `run_id`, `batch_id`, `transformation_run_id`;
-- per table: records received, inserted, updated, rejected, and status;
-- the data now available: the five `warehouse` tables, current as of the batch window.
-
-**Example completion summary:**
+| Overall Condition | Acceptance Decision | Pipeline Action |
+| --- | --- | --- |
+| All tables PASS | APPROVED | Mark batch complete, publish data |
+| One or more non-critical WARNING | MANUAL REVIEW | Hold publication, notify owner |
+| One or more critical FAIL | REJECTED | Roll back, retry, or stop |
 
 | Validation Summary | Result |
 | --- | --- |
@@ -450,30 +303,27 @@ When a batch completes, the load reports:
 | `fact_payment` load | WARNING |
 | **Overall Load** | **MANUAL REVIEW** |
 
-**How downstream users know new data is available:** dashboards and reports read `warehouse.latest_successful_load`, which shows the latest approved batch and its load time, and display it as "data as of". A batch that is held or rejected never appears there, so users keep seeing the previous complete batch.
-
 ---
 
 ## 9. Common Load Problems and Mitigation
 
-| # | Problem | Possible Cause | Impact | Mitigation |
-| --- | --- | --- | --- | --- |
-| 1 | Duplicate rows or inflated totals after a rerun | Airflow retry, or a batch started twice by hand | Double-counted consumption, billing, and collections | Upsert on the natural key makes reruns harmless; PRE-08 stops an already-loaded batch; POST-03 and POST-06 confirm no duplicates and equal sums |
-| 2 | Foreign key violation | A fact loaded before its parent, or a parent row missing from the handover | Load error or orphan facts | Fixed load order (Section 1.4); orphans are rejected and counted before the merge; POST-04 verifies 100% match |
-| 3 | Partial load after a crash | Worker killed or connection dropped in the middle of the batch | Dimensions updated but facts not: inconsistent dashboards | The whole batch is one transaction; PostgreSQL discards it if the connection dies; the rerun starts clean |
-| 4 | Warehouse unreachable or project paused | Supabase pauses free projects after about 7 days without activity; network outage; maintenance | Load cannot start; dashboards also down | PRE-01 with 3 connection attempts, then Airflow retries (3 × 5 minutes); the daily load keeps the project active; if paused, the data engineer resumes it in the Supabase dashboard and reruns the batch |
-| 5 | Connection refused or dropped by the pooler | Wrong pooler mode or port, direct (IPv6-only) host used from Docker, or special characters in the password not URL-encoded | Load fails at PRE-01, or drops mid-transaction | Use the session pooler connection string; URL-encode the password (`DOCKER.md`); the load uses only two connections |
-| 6 | Database reaches the 500 MB plan limit | Growth of fact tables and `load_log` over time | Supabase puts the database in read-only mode; loads fail | PRE-09 warns at 80% and stops at 95%; `load_log` rows are archived after 1 year; upgrade the plan or archive old periods before the limit is reached |
-| 7 | Handover schema does not match the warehouse | Stage 2 added, renamed, or retyped a column without updating `db/warehouse_schema.sql` | Insert errors, or values in the wrong column | PRE-05 rejects the batch before anything is written; the contract and the schema script are updated together, then the batch is rerun |
-| 8 | Handover file changed or incomplete after validation | Transformation rerun while the load was starting, interrupted copy, or manual edit | Unvalidated data could reach the warehouse | PRE-06 (row count) and PRE-07 (SHA-256 checksum) compare the files with the transformation log |
-| 9 | Loading a batch that the transformation rejected | The CSV files exist even when Stage 2 rejects or holds a batch | Wrong figures published | PRE-04 reads the status from the transformation log, never from the presence of files |
-| 10 | Load runs too long or times out | Row-by-row inserts, or growth in data volume | Dashboards show old data in the morning; pooler may cut the connection | Bulk insert into staging plus one merge statement per table; indexes on match keys; POST-09 warns when a run exceeds 15 minutes |
-| 11 | Missed day | Machine or Airflow was off at 03:00 | The warehouse stays one or more batches behind | `latest_successful_load` shows the data date; because each handover is a full snapshot, loading the newest batch brings the warehouse fully up to date |
+| Problem | Possible Cause | Impact | Mitigation |
+| --- | --- | --- | --- |
+| Duplicate rows after a rerun | Airflow retry, or the batch started twice by hand | Inflated consumption, billing, and collection totals | Upsert on the match key; duplicate batch check before load; key uniqueness and amount checks after load |
+| Foreign key violation | Fact loaded before its parent, or parent row missing from the handover | Load fails or orphan facts | Enforce load order; reject and count facts with no matching parent; referential integrity check |
+| Partial load after a crash | Worker killed or connection dropped mid-batch | Inconsistent target data (dimensions updated, facts not) | Load the whole batch in one transaction and roll back on failure |
+| Warehouse unreachable | Supabase pauses free projects after about 7 days without activity; network outage | Load cannot start; dashboards unavailable | Connection check with 3 attempts, then 3 Airflow retries; daily load keeps the project active; resume the project and run the batch again |
+| Connection refused or dropped | Wrong pooler mode or port; IPv6-only direct host used from Docker; password not URL-encoded | Load fails at the connection check or mid-transaction | Use the session pooler connection string; URL-encode the password (`DOCKER.md`) |
+| Database reaches the storage limit | Fact tables and `load_log` grow past the 500 MB free-plan limit | Database becomes read-only; loads fail | Storage check warns at 80% and stops at 95%; archive old `load_log` rows; upgrade the plan |
+| Handover schema does not match the target | Transformation added or renamed a column without updating `db/warehouse_schema.sql` | Insert errors or values in the wrong column | Schema match check rejects the batch; update the contract and schema script together, then rerun |
+| Handover file changed after validation | Transformation rerun during the load, interrupted copy, or manual edit | Unvalidated data reaches the warehouse | Record count and file integrity (checksum) checks against the transformation log |
+| Rejected batch gets loaded | Transformation writes its CSV files even when it rejects a batch | Wrong figures published | Handover status check reads the status from the transformation log, not from the presence of files |
+| Load runs too long | Row-by-row inserts, or data volume growth | Delays reporting; pooler may time out | Bulk insert into a staging table and one merge per table; indexes on match keys; load duration warning |
 
 ---
 
 ## Expected Output
 
-The documentation must be consistent with the implemented load process and provide sufficient information for a team member to understand, validate, monitor, and maintain the load stage.
+The documentation is consistent with the implemented load process and provides sufficient information for a team member to understand, validate, monitor, and maintain the load stage.
 
-The loaded data is validated, reconciled with the transformed input, and logged so that every batch can be traced, audited, and recovered. No extraction or transformation logic is added in this stage.
+The loaded data is validated, reconciled with the transformed input, and logged so that every batch can be traced, audited, and recovered. No new extraction or transformation logic is added in this stage.
