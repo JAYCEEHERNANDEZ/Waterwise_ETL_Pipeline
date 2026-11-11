@@ -11,6 +11,9 @@ Implements docs/load.md:
 Implemented so far:
 - Reading and describing the transformation handover (Section 1, Load Input).
 - Pre-load validation checks (Section 4). They only read; nothing is written.
+- Loading the dimensions dim_purok and dim_consumer (Section 3): bulk copy into
+  a staging table, reject rows that break a target constraint, then upsert on
+  the match key (SCD Type 1). Committed only when nothing was rejected.
 
 Connection: WAREHOUSE_DB_URL (session pooler, role etl_loader), read from
 pipeline/.env or the repo-root .env. Never committed, never logged.
@@ -40,12 +43,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import os
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -61,8 +66,10 @@ except ImportError:  # pragma: no cover - environment variables still work
 
 try:
     import psycopg2
+    from psycopg2 import sql as psycopg2_sql
 except ImportError:  # pragma: no cover - surfaced by the connection check
     psycopg2 = None
+    psycopg2_sql = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -152,6 +159,33 @@ LOAD_ORDER = (
     "fact_billing",
     "fact_payment",
 )
+DIMENSIONS = ("dim_purok", "dim_consumer")
+
+# docs/load.md Section 2 and 3: surrogate primary key, and the match key the
+# upsert uses to find an existing row (the natural key from the source).
+PRIMARY_KEYS = {
+    "dim_purok": "purok_key",
+    "dim_consumer": "consumer_key",
+    "fact_consumption": "consumption_key",
+    "fact_billing": "billing_key",
+    "fact_payment": "payment_key",
+}
+MATCH_KEYS = {
+    "dim_purok": "purok_no",
+    "dim_consumer": "consumer_id",
+    "fact_consumption": "consumption_id",
+    "fact_billing": "billing_id",
+    "fact_payment": "payment_id",
+}
+# (column, parent table, parent column) for every foreign key in the warehouse.
+FOREIGN_KEYS = {
+    "dim_purok": [],
+    "dim_consumer": [("purok_key", "dim_purok", "purok_key")],
+    "fact_consumption": [("consumer_key", "dim_consumer", "consumer_key")],
+    "fact_billing": [("consumption_key", "fact_consumption", "consumption_key"),
+                     ("consumer_key", "dim_consumer", "consumer_key")],
+    "fact_payment": [("billing_key", "fact_billing", "billing_key")],
+}
 
 
 def log(msg: str) -> None:
@@ -465,10 +499,6 @@ class Check:
                 "severity": self.severity, "status": self.status, "detail": self.detail}
 
 
-def _fail_status(severity: str) -> str:
-    return "FAIL" if severity == CRITICAL else "WARNING"
-
-
 def check_target_connection(dsn: str | None) -> tuple[Check, Any]:
     check = Check("Target connection", "Warehouse database",
                   f"Connection succeeds within {CONNECT_TIMEOUT_S} seconds "
@@ -606,12 +636,44 @@ def check_schema_match(handover: Handover, cur) -> Check:
     return check
 
 
+# Row Level Security command codes in pg_policy.polcmd.
+_POLICY_CMD = {"SELECT": "r", "INSERT": "a", "UPDATE": "w"}
+
+
+def _rls_allows(cur, qualified: str, privilege: str) -> bool:
+    """True unless Row Level Security would block `privilege` for the current role.
+
+    With RLS on, a role that is not the owner (and has no BYPASSRLS) needs a
+    policy for the command; without one it reads no rows and cannot write.
+    """
+    cur.execute(
+        """
+        SELECT NOT c.relrowsecurity
+            OR pg_get_userbyid(c.relowner) = current_user
+            OR (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user)
+            OR EXISTS (
+                SELECT 1 FROM pg_policy p
+                WHERE p.polrelid = c.oid
+                  AND p.polcmd IN (%s, '*')
+                  AND (0 = ANY (p.polroles)
+                       OR (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                          = ANY (p.polroles)))
+        FROM pg_class c
+        WHERE c.oid = to_regclass(%s)
+        """,
+        (_POLICY_CMD[privilege], qualified),
+    )
+    row = cur.fetchone()
+    return bool(row and row[0])
+
+
 def check_write_permission(cur) -> Check:
     check = Check("Write permission", f"{WAREHOUSE_SCHEMA} schema, load role",
-                  "Role can INSERT and UPDATE all five tables, INSERT into load_log, "
-                  "and create temporary tables", CRITICAL)
-    wanted = [(t, p) for t in LOAD_ORDER for p in ("INSERT", "UPDATE")]
-    wanted += [("load_log", "INSERT"), ("load_log", "SELECT")]
+                  "Role can read, INSERT and UPDATE all five tables, read and INSERT into "
+                  "load_log (GRANTs and row-level security policies), and create "
+                  "temporary tables", CRITICAL)
+    wanted = [(t, p) for t in LOAD_ORDER for p in ("SELECT", "INSERT", "UPDATE")]
+    wanted += [("load_log", "SELECT"), ("load_log", "INSERT")]
     missing: list[str] = []
     for table, privilege in wanted:
         qualified = f"{WAREHOUSE_SCHEMA}.{table}"
@@ -622,6 +684,8 @@ def check_write_permission(cur) -> Check:
         cur.execute("SELECT has_table_privilege(current_user, %s, %s)", (qualified, privilege))
         if not cur.fetchone()[0]:
             missing.append(f"{privilege} on {qualified}")
+        elif not _rls_allows(cur, qualified, privilege):
+            missing.append(f"row-level security policy for {privilege} on {qualified}")
     cur.execute("SELECT has_database_privilege(current_user, current_database(), 'TEMP')")
     if not cur.fetchone()[0]:
         missing.append("TEMP on the database")
@@ -755,6 +819,256 @@ def print_checks(title: str, checks: list[Check]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Writing a table (docs/load.md Section 3, Write Logic)
+# ---------------------------------------------------------------------------
+# For each table:
+#   1. Check every row against the target column types, lengths and NOT NULL.
+#   2. Bulk-copy the valid rows into a temporary staging table.
+#   3. Reject rows that break a CHECK constraint, have no parent row, or would
+#      collide with a different record already in the target.
+#   4. Upsert the rest: INSERT ... ON CONFLICT (match key) DO UPDATE.
+# Rejected rows are not written; they are counted and kept with a reason.
+# Nothing here commits: the caller owns the transaction.
+
+@dataclass
+class RejectedRow:
+    table: str
+    row_no: int                 # 1-based data row number in the handover CSV
+    key: str | None             # match key value, for tracing
+    reason: str
+    values: dict[str, str]
+
+
+@dataclass
+class TableResult:
+    table: str
+    started_at: datetime
+    ended_at: datetime | None = None
+    received: int = 0
+    inserted: int = 0
+    updated: int = 0
+    rejected: list[RejectedRow] = field(default_factory=list)
+
+    @property
+    def duration_sec(self) -> int:
+        end = self.ended_at or datetime.now(PHT)
+        return max(0, round((end - self.started_at).total_seconds()))
+
+
+@dataclass
+class ColumnInfo:
+    name: str
+    data_type: str
+    max_length: int | None
+    precision: int | None
+    scale: int | None
+    nullable: bool
+
+
+INT_RANGES = {"integer": (-2**31, 2**31 - 1), "smallint": (-2**15, 2**15 - 1),
+              "bigint": (-2**63, 2**63 - 1)}
+BOOL_TEXT = {"true", "false", "t", "f", "1", "0", "yes", "no"}
+
+
+def target_column_info(cur, table: str) -> list[ColumnInfo]:
+    cur.execute(
+        """
+        SELECT column_name, data_type, character_maximum_length,
+               numeric_precision, numeric_scale, is_nullable = 'YES'
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        ORDER BY ordinal_position
+        """,
+        (WAREHOUSE_SCHEMA, table),
+    )
+    return [ColumnInfo(*row) for row in cur.fetchall()]
+
+
+def value_problem(value: str, col: ColumnInfo) -> str | None:
+    """Why `value` cannot be stored in `col`, or None if it can. '' means NULL."""
+    if value == "":
+        return None if col.nullable else f"NOT_NULL: {col.name} is empty"
+    kind = col.data_type
+    try:
+        if kind in INT_RANGES:
+            low, high = INT_RANGES[kind]
+            if not low <= int(value) <= high:
+                return f"TYPE: {col.name}={value!r} is out of range for {kind}"
+        elif kind == "numeric":
+            number = Decimal(value)
+            if not number.is_finite():
+                return f"TYPE: {col.name}={value!r} is not a finite number"
+            if col.precision is not None and col.scale is not None:
+                whole_digits = len(str(abs(int(number)))) if abs(number) >= 1 else 0
+                if whole_digits > col.precision - col.scale:
+                    return (f"TYPE: {col.name}={value!r} does not fit "
+                            f"numeric({col.precision},{col.scale})")
+        elif kind == "date":
+            date.fromisoformat(value)
+        elif kind.startswith("timestamp"):
+            datetime.fromisoformat(value)
+        elif kind == "boolean":
+            if value.strip().lower() not in BOOL_TEXT:
+                return f"TYPE: {col.name}={value!r} is not a boolean"
+    except (ValueError, ArithmeticError):
+        return f"TYPE: {col.name}={value!r} is not a valid {kind}"
+    if col.max_length is not None and len(value) > col.max_length:
+        return f"TYPE: {col.name} is {len(value)} characters, limit {col.max_length}"
+    return None
+
+
+def _ident(*parts: str):
+    return psycopg2_sql.Identifier(*parts)
+
+
+def _check_expressions(cur, table: str) -> list[tuple[str, str]]:
+    """(constraint name, boolean expression) for every CHECK on the target table."""
+    cur.execute(
+        """
+        SELECT conname, pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = to_regclass(%s) AND contype = 'c'
+        ORDER BY conname
+        """,
+        (f"{WAREHOUSE_SCHEMA}.{table}",),
+    )
+    expressions = []
+    for name, definition in cur.fetchall():
+        expression = definition.strip()
+        if expression.upper().startswith("CHECK"):
+            expression = expression[5:].strip()
+        if expression.upper().endswith("NOT VALID"):
+            expression = expression[:-9].strip()
+        expressions.append((name, expression))
+    return expressions
+
+
+def load_table(cur, item: TableHandover, batch_id: str) -> TableResult:
+    """Write one handover table into the warehouse. Does not commit."""
+    table = item.table
+    result = TableResult(table=table, started_at=datetime.now(PHT), received=item.row_count)
+    match_key, primary_key = MATCH_KEYS[table], PRIMARY_KEYS[table]
+    columns = list(item.header)
+    target = {c.name: c for c in target_column_info(cur, table)}
+
+    def reject(row_no: int, reason: str) -> None:
+        values = item.rows[row_no - 1]
+        result.rejected.append(RejectedRow(table, row_no, values.get(match_key) or None,
+                                           reason, values))
+
+    # --- 1. Types, lengths, NOT NULL, and duplicate keys within the batch ----
+    valid: list[tuple[int, dict[str, str]]] = []
+    seen_match: set[str] = set()
+    seen_primary: set[str] = set()
+    for row_no, row in enumerate(item.rows, start=1):
+        problem = next((p for c in columns
+                        if (p := value_problem(row.get(c) or "", target[c])) is not None), None)
+        if problem is None and row[match_key] in seen_match:
+            problem = f"DUPLICATE_KEY: {match_key}={row[match_key]} appears more than once"
+        if problem is None and row[primary_key] in seen_primary:
+            problem = f"DUPLICATE_KEY: {primary_key}={row[primary_key]} appears more than once"
+        if problem:
+            reject(row_no, problem)
+            continue
+        seen_match.add(row[match_key])
+        seen_primary.add(row[primary_key])
+        valid.append((row_no, row))
+
+    # --- 2. Bulk-copy valid rows into a typed staging table ------------------
+    staging = _ident("pg_temp", f"stg_{table}")
+    column_list = psycopg2_sql.SQL(", ").join(_ident(c) for c in columns)
+    cur.execute(psycopg2_sql.SQL(
+        "DROP TABLE IF EXISTS {stg}; "
+        "CREATE TEMP TABLE {stg} ON COMMIT DROP AS "
+        "SELECT 0::integer AS _row_no, {cols} FROM {target} WITH NO DATA"
+    ).format(stg=staging, cols=column_list,
+             target=_ident(WAREHOUSE_SCHEMA, table)))
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    for row_no, row in valid:
+        writer.writerow([row_no, *(row.get(c) or "" for c in columns)])
+    buffer.seek(0)
+    cur.copy_expert(psycopg2_sql.SQL(
+        "COPY {stg} (_row_no, {cols}) FROM STDIN WITH (FORMAT csv, NULL '')"
+    ).format(stg=staging, cols=column_list).as_string(cur), buffer)
+
+    # --- 3. Constraint checks that need SQL -----------------------------------
+    sql_rejects: dict[int, str] = {}
+
+    def collect(query, reason: str) -> None:
+        cur.execute(query)
+        for (row_no,) in cur.fetchall():
+            sql_rejects.setdefault(row_no, reason)
+
+    for name, expression in _check_expressions(cur, table):
+        collect(psycopg2_sql.SQL("SELECT _row_no FROM {stg} WHERE ({expr}) IS FALSE").format(
+            stg=staging, expr=psycopg2_sql.SQL(expression)),
+            f"CHECK: {name} failed")
+    for column, parent, parent_column in FOREIGN_KEYS[table]:
+        collect(psycopg2_sql.SQL(
+            "SELECT s._row_no FROM {stg} s WHERE s.{col} IS NOT NULL AND NOT EXISTS "
+            "(SELECT 1 FROM {parent} p WHERE p.{pcol} = s.{col})"
+        ).format(stg=staging, col=_ident(column),
+                 parent=_ident(WAREHOUSE_SCHEMA, parent), pcol=_ident(parent_column)),
+            f"FK_NOT_FOUND: {column} has no row in {parent}")
+    # The same record must keep the same surrogate key, and one surrogate key
+    # must not belong to two records; either would break the upsert.
+    collect(psycopg2_sql.SQL(
+        "SELECT s._row_no FROM {stg} s JOIN {target} t "
+        "ON t.{pk} = s.{pk} AND t.{mk} IS DISTINCT FROM s.{mk} "
+        "UNION SELECT s._row_no FROM {stg} s JOIN {target} t "
+        "ON t.{mk} = s.{mk} AND t.{pk} IS DISTINCT FROM s.{pk}"
+    ).format(stg=staging, target=_ident(WAREHOUSE_SCHEMA, table),
+             pk=_ident(primary_key), mk=_ident(match_key)),
+        f"KEY_CONFLICT: {primary_key}/{match_key} pairing differs from the warehouse")
+
+    for row_no, reason in sorted(sql_rejects.items()):
+        reject(row_no, reason)
+    if sql_rejects:
+        cur.execute(psycopg2_sql.SQL("DELETE FROM {stg} WHERE _row_no = ANY(%s)").format(
+            stg=staging), (list(sql_rejects),))
+
+    # --- 4. Upsert (SCD Type 1: overwrite every column except the keys) ------
+    update_columns = [c for c in columns if c not in (primary_key, match_key)]
+    assignments = psycopg2_sql.SQL(", ").join(
+        psycopg2_sql.SQL("{c} = EXCLUDED.{c}").format(c=_ident(c))
+        for c in [*update_columns, *LOAD_COLUMNS])
+    cur.execute(psycopg2_sql.SQL(
+        "INSERT INTO {target} AS t ({cols}, load_batch_id, loaded_at) "
+        "SELECT {cols}, %s, now() FROM {stg} ORDER BY _row_no "
+        "ON CONFLICT ({mk}) DO UPDATE SET {assignments} "
+        "RETURNING (xmax = 0)"
+    ).format(target=_ident(WAREHOUSE_SCHEMA, table), cols=column_list,
+             stg=staging, mk=_ident(match_key), assignments=assignments),
+        (batch_id,))
+    flags = [inserted for (inserted,) in cur.fetchall()]
+    result.inserted = sum(1 for f in flags if f)
+    result.updated = len(flags) - result.inserted
+    result.rejected.sort(key=lambda r: r.row_no)
+    result.ended_at = datetime.now(PHT)
+    return result
+
+
+def load_dimensions(conn, handover: Handover) -> dict[str, TableResult]:
+    """Load dim_purok then dim_consumer inside the caller's transaction."""
+    results: dict[str, TableResult] = {}
+    with conn.cursor() as cur:
+        for table in DIMENSIONS:
+            results[table] = load_table(cur, handover.tables[table], handover.batch_id)
+    return results
+
+
+def print_results(results: dict[str, TableResult]) -> None:
+    for r in results.values():
+        log(f"  {r.table}: received={r.received} inserted={r.inserted} "
+            f"updated={r.updated} rejected={len(r.rejected)} ({r.duration_sec}s)")
+        for rej in r.rejected[:10]:
+            log(f"    rejected row {rej.row_no} ({MATCH_KEYS[r.table]}={rej.key}): {rej.reason}")
+        if len(r.rejected) > 10:
+            log(f"    ... {len(r.rejected) - 10} more rejected row(s)")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -797,24 +1111,44 @@ def main(argv: list[str] | None = None) -> int:
     log(f"Run {run_id} | load_code_version={LOAD_CODE_VERSION}")
     describe_handover(handover)
 
+    dsn = get_warehouse_dsn()
     checks, conn = run_pre_load_checks(
-        handover, get_warehouse_dsn(),
+        handover, dsn,
         force_reload=args.force_reload,
         released_by=args.handover_released_by,
     )
-    if conn is not None:
-        conn.close()
     print_checks("Pre-load validation checks (docs/load.md Section 4):", checks)
-
     decision = decide(checks)
     log(f"pre_load_result = {summarize_checks(checks)}")
     if decision == "REJECTED":
+        if conn is not None:
+            conn.close()
         log("REJECTED: a critical pre-load check failed. Nothing was written to the warehouse.")
         return 1
-    if decision == "MANUAL REVIEW":
-        log("Pre-load WARNING: no critical failure, but a non-critical check needs review.")
+
+    # --- Load (one transaction; docs/load.md Section 3) ----------------------
+    try:
+        log("Loading dimensions (upsert, SCD Type 1):")
+        results = load_dimensions(conn, handover)
+        print_results(results)
+    except Exception as exc:  # noqa: BLE001 - any error rolls the batch back
+        conn.rollback()
+        conn.close()
+        log(f"REJECTED: load error, transaction rolled back: "
+            f"{mask(f'{type(exc).__name__}: {str(exc).strip()}', dsn)}")
+        return 1
+
+    rejected = sum(len(r.rejected) for r in results.values())
+    if decision == "MANUAL REVIEW" or rejected:
+        conn.rollback()
+        conn.close()
+        log(f"MANUAL REVIEW: {rejected} rejected row(s) or a pre-load warning. "
+            "Transaction rolled back; nothing was published.")
         return 3
-    log(f"Pre-load PASS: {handover.batch_id} is ready to load ({handover.total_rows} rows).")
+    conn.commit()
+    conn.close()
+    log(f"Committed {handover.batch_id}: "
+        + ", ".join(f"{t} +{r.inserted} new / {r.updated} updated" for t, r in results.items()))
     return 0
 
 

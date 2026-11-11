@@ -270,4 +270,44 @@ GRANT SELECT ON warehouse.latest_successful_load TO etl_loader;
 GRANT USAGE ON SCHEMA warehouse TO warehouse_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA warehouse TO warehouse_reader;
 
+-- -----------------------------------------------------------------------------
+-- Row Level Security
+-- Supabase can turn RLS on for every new table. With RLS on and no policy, a
+-- role that is not the owner sees no rows and cannot write, even with GRANTs.
+-- RLS is enabled explicitly here, and each policy allows exactly what the
+-- GRANTs above allow, so the GRANTs stay the single place that limits access
+-- (for example, etl_loader still has no DELETE).
+-- -----------------------------------------------------------------------------
+
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['dim_purok', 'dim_consumer', 'fact_consumption',
+                             'fact_billing', 'fact_payment', 'load_log']
+    LOOP
+        EXECUTE format('ALTER TABLE warehouse.%I ENABLE ROW LEVEL SECURITY', t);
+
+        EXECUTE format('DROP POLICY IF EXISTS etl_loader_select ON warehouse.%I', t);
+        EXECUTE format('CREATE POLICY etl_loader_select ON warehouse.%I '
+                       'FOR SELECT TO etl_loader USING (true)', t);
+
+        EXECUTE format('DROP POLICY IF EXISTS etl_loader_insert ON warehouse.%I', t);
+        EXECUTE format('CREATE POLICY etl_loader_insert ON warehouse.%I '
+                       'FOR INSERT TO etl_loader WITH CHECK (true)', t);
+
+        EXECUTE format('DROP POLICY IF EXISTS warehouse_reader_select ON warehouse.%I', t);
+        EXECUTE format('CREATE POLICY warehouse_reader_select ON warehouse.%I '
+                       'FOR SELECT TO warehouse_reader USING (true)', t);
+
+        -- load_log is append-only: no UPDATE policy.
+        EXECUTE format('DROP POLICY IF EXISTS etl_loader_update ON warehouse.%I', t);
+        IF t <> 'load_log' THEN
+            EXECUTE format('CREATE POLICY etl_loader_update ON warehouse.%I '
+                           'FOR UPDATE TO etl_loader USING (true) WITH CHECK (true)', t);
+        END IF;
+    END LOOP;
+END
+$$;
+
 COMMIT;
