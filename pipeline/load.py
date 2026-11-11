@@ -10,17 +10,28 @@ Implements docs/load.md:
 
 Implemented so far:
 - Reading and describing the transformation handover (Section 1, Load Input).
+- Pre-load validation checks (Section 4). They only read; nothing is written.
+
+Connection: WAREHOUSE_DB_URL (session pooler, role etl_loader), read from
+pipeline/.env or the repo-root .env. Never committed, never logged.
 
 Usage:
-    # Read the newest handover
+    # Check the newest handover against the warehouse
     python -m pipeline.load
 
-    # Read the handover of a specific transformation run date
+    # Check the handover of a specific transformation run date
     python -m pipeline.load --run-date 2026-03-10
 
+    # A batch that was already loaded with SUCCESS (intentional reload)
+    python -m pipeline.load --run-date 2026-03-10 --force-reload
+
+    # A transformation batch on MANUAL REVIEW, released by a named reviewer
+    python -m pipeline.load --handover-released-by "Juan Dela Cruz"
+
 Exit codes:
-    0 = handover read successfully
-    1 = handover found but incomplete or inconsistent
+    0 = all pre-load checks PASS
+    3 = no critical failure, but one or more non-critical WARNING
+    1 = one or more critical FAIL (the load must not start)
     2 = usage / input error (no handover to read)
 """
 
@@ -30,11 +41,28 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
+
+try:
+    from dotenv import load_dotenv
+    _HERE = Path(__file__).resolve().parent
+    # Same order as stage.py: pipeline/.env first, then the repo-root .env.
+    load_dotenv(_HERE / ".env")
+    load_dotenv(_HERE.parent / ".env")
+except ImportError:  # pragma: no cover - environment variables still work
+    pass
+
+try:
+    import psycopg2
+except ImportError:  # pragma: no cover - surfaced by the connection check
+    psycopg2 = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,6 +72,73 @@ TRANSFORMED_ROOT = BASE_DIR / "transformed"
 TRANSFORMATION_LOG_ROOT = BASE_DIR / "logs" / "waterwise-transformation"
 
 LOAD_CODE_VERSION = "v1.0"
+WAREHOUSE_SCHEMA = "warehouse"
+
+# Target connection check (docs/load.md Section 4).
+CONNECT_TIMEOUT_S = 10
+CONNECT_ATTEMPTS = 3
+CONNECT_BACKOFF_S = (2, 4)
+
+# Storage checks (docs/load.md Section 4). The Supabase free plan allows
+# 500 MB; override with WAREHOUSE_STORAGE_LIMIT_MB on a paid plan.
+STORAGE_LIMIT_MB_DEFAULT = 500
+STORAGE_FAIL_PCT = 95
+STORAGE_WARN_PCT = 80
+
+# Columns the load stage adds to every dimension and fact table; they are not
+# part of the transformation handover.
+LOAD_COLUMNS = ("load_batch_id", "loaded_at")
+
+# Expected target column types (docs/transformation.md Section 6.1, as created
+# by db/warehouse_schema.sql), in information_schema.columns.data_type terms.
+_CHAR, _VARCHAR = "character", "character varying"
+_INT, _SMALLINT, _NUM = "integer", "smallint", "numeric"
+_DATE, _TS, _BOOL = "date", "timestamp with time zone", "boolean"
+EXPECTED_TYPES: dict[str, dict[str, str]] = {
+    "dim_purok": {
+        "purok_key": _CHAR, "purok_no": _INT, "purok_label": _VARCHAR,
+        "is_unknown": _BOOL,
+    },
+    "dim_consumer": {
+        "consumer_key": _CHAR, "consumer_id": _INT, "username": _VARCHAR,
+        "first_name": _VARCHAR, "middle_name": _VARCHAR, "last_name": _VARCHAR,
+        "full_name": _VARCHAR, "email": _VARCHAR, "contact_number": _VARCHAR,
+        "purok_key": _CHAR, "purok_no": _INT, "purok_is_unknown": _BOOL,
+        "status": _VARCHAR, "code_unmapped": _BOOL, "active_flag": _BOOL,
+        "valid_from": _TS, "valid_to": _TS, "is_current": _BOOL,
+        "created_at": _TS, "updated_at": _TS, "transformation_run_id": _VARCHAR,
+    },
+    "fact_consumption": {
+        "consumption_key": _CHAR, "consumption_id": _INT, "consumer_key": _CHAR,
+        "reading_date": _DATE, "reading_year": _SMALLINT, "reading_month": _SMALLINT,
+        "billing_period": _CHAR, "previous_reading": _NUM, "present_reading": _NUM,
+        "consumption": _NUM, "consumption_cbm": _NUM, "days_in_period": _INT,
+        "consumption_per_day": _NUM, "reading_date_adjusted": _BOOL,
+        "transformation_run_id": _VARCHAR,
+    },
+    "fact_billing": {
+        "billing_key": _CHAR, "billing_id": _INT, "consumption_key": _CHAR,
+        "consumer_key": _CHAR, "billing_date": _DATE, "due_date": _DATE,
+        "billing_year": _SMALLINT, "billing_month": _SMALLINT, "billing_period": _CHAR,
+        "total_bill": _NUM, "remaining_balance": _NUM, "status": _VARCHAR,
+        "status_recomputed": _BOOL, "balance_corrected": _BOOL,
+        "due_date_corrected": _BOOL, "is_revenue_recognized": _BOOL,
+        "days_to_due": _INT, "days_overdue": _INT, "is_overdue": _BOOL,
+        "overdue_bucket": _VARCHAR, "outstanding_bill_count": _INT,
+        "is_flagged_account": _BOOL, "transformation_run_id": _VARCHAR,
+    },
+    "fact_payment": {
+        "payment_key": _CHAR, "payment_id": _INT, "billing_key": _CHAR,
+        "payment_date": _DATE, "payment_year": _SMALLINT, "payment_month": _SMALLINT,
+        "payment_method": _VARCHAR, "code_unmapped": _BOOL, "total_paid": _NUM,
+        "amount_tendered": _NUM, "change_given": _NUM, "remaining_balance": _NUM,
+        "reference_number": _VARCHAR, "payment_allocation_rank": _INT,
+        "is_oldest_unpaid_payment": _BOOL, "collection_rate": _NUM,
+        "change_corrected": _BOOL, "transformation_run_id": _VARCHAR,
+    },
+}
+for _columns in EXPECTED_TYPES.values():
+    _columns.update({"load_batch_id": _VARCHAR, "loaded_at": _TS})
 
 # Asia/Manila has no DST; a fixed +08:00 offset is exact.
 PHT = timezone(timedelta(hours=8))
@@ -285,6 +380,381 @@ def describe_handover(handover: Handover) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Warehouse connection
+# ---------------------------------------------------------------------------
+
+def get_warehouse_dsn() -> str | None:
+    value = os.environ.get("WAREHOUSE_DB_URL", "").strip().strip('"').strip("'")
+    return value or None
+
+
+def mask(text: str, dsn: str | None) -> str:
+    """Remove the password (raw and URL-decoded) from a message before printing it."""
+    if not dsn:
+        return text
+    try:
+        raw = urlsplit(dsn).password
+    except ValueError:
+        raw = None
+    for secret in {raw, unquote(raw) if raw else None}:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def project_ref(dsn: str | None) -> str | None:
+    """Supabase project ref from a DSN: pooler user `role.<ref>` or host `db.<ref>.supabase.co`."""
+    if not dsn:
+        return None
+    try:
+        parts = urlsplit(dsn)
+        user, host = parts.username or "", parts.hostname or ""
+    except ValueError:
+        return None
+    if "." in user:
+        return user.split(".", 1)[1]
+    if host.startswith("db.") and host.endswith(".supabase.co"):
+        return host.split(".")[1]
+    return None
+
+
+def connect_warehouse(dsn: str):
+    """Connect with CONNECT_ATTEMPTS attempts. Raises the last error."""
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 is not installed. Run: pip install -r pipeline/requirements.txt")
+    last_exc: Exception | None = None
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        try:
+            conn = psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT_S,
+                                    application_name="waterwise-load")
+            conn.autocommit = False
+            return conn
+        except psycopg2.OperationalError as exc:
+            last_exc = exc
+            log(f"warehouse connection attempt {attempt}/{CONNECT_ATTEMPTS} failed: "
+                f"{mask(str(exc).strip(), dsn)}")
+            # A wrong password does not fix itself, and repeated failed logins
+            # make the Supabase pooler block new connections for a while
+            # (ECIRCUITBREAKER). Retrying either one only extends the block.
+            message = str(exc)
+            if "authentication failed" in message or "ECIRCUITBREAKER" in message:
+                break
+            if attempt < CONNECT_ATTEMPTS:
+                time.sleep(CONNECT_BACKOFF_S[min(attempt - 1, len(CONNECT_BACKOFF_S) - 1)])
+    raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Pre-load validation checks (docs/load.md Section 4)
+# ---------------------------------------------------------------------------
+
+CRITICAL, NON_CRITICAL = "Critical", "Non-critical"
+
+
+@dataclass
+class Check:
+    name: str
+    target: str
+    criteria: str
+    severity: str
+    status: str = "PASS"          # PASS / WARNING / FAIL / NOT RUN
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, str]:
+        return {"name": self.name, "target": self.target, "criteria": self.criteria,
+                "severity": self.severity, "status": self.status, "detail": self.detail}
+
+
+def _fail_status(severity: str) -> str:
+    return "FAIL" if severity == CRITICAL else "WARNING"
+
+
+def check_target_connection(dsn: str | None) -> tuple[Check, Any]:
+    check = Check("Target connection", "Warehouse database",
+                  f"Connection succeeds within {CONNECT_TIMEOUT_S} seconds "
+                  f"(up to {CONNECT_ATTEMPTS} attempts)", CRITICAL)
+    if not dsn:
+        check.status, check.detail = "FAIL", "WAREHOUSE_DB_URL is not set (pipeline/.env or .env)"
+        return check, None
+    # Safety: the load must never write to the main application database.
+    main_ref = project_ref(os.environ.get("WATERWISE_DB_URL"))
+    target_ref = project_ref(dsn)
+    if main_ref and target_ref and main_ref == target_ref:
+        check.status = "FAIL"
+        check.detail = ("WAREHOUSE_DB_URL points at the main WaterWise project; "
+                        "the load only writes to the warehouse project")
+        return check, None
+    try:
+        conn = connect_warehouse(dsn)
+    except Exception as exc:  # noqa: BLE001 - reported as a failed check
+        check.status = "FAIL"
+        check.detail = mask(f"{type(exc).__name__}: {str(exc).strip()}", dsn)
+        return check, None
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_user, current_database()")
+        user, database = cur.fetchone()
+    conn.rollback()
+    check.detail = f"connected as {user} to {database} (project {target_ref or 'unknown'})"
+    return check, conn
+
+
+def check_handover_completeness(handover: Handover) -> Check:
+    check = Check("Handover completeness", f"transformed/<table>/{handover.run_date}/",
+                  "CSV, .schema.json, and transformation log exist for all five tables",
+                  CRITICAL)
+    if handover.problems:
+        check.status = "FAIL"
+        check.detail = "; ".join(handover.problems)
+    else:
+        check.detail = f"{len(handover.tables)} tables complete"
+    return check
+
+
+def check_handover_status(handover: Handover, released_by: str | None) -> Check:
+    check = Check("Handover status", "Transformation metadata",
+                  "Status = APPROVED for all tables (MANUAL REVIEW only when released "
+                  "by a named reviewer)", CRITICAL)
+    statuses = {t: item.transformation_status for t, item in handover.tables.items()}
+    not_approved = {t: s for t, s in statuses.items() if s != "APPROVED"}
+    if not not_approved:
+        check.detail = "all tables APPROVED"
+    elif released_by and all(s == "MANUAL REVIEW" for s in not_approved.values()):
+        check.detail = f"MANUAL REVIEW batch released by {released_by}"
+    else:
+        check.status = "FAIL"
+        check.detail = ", ".join(f"{t}={s}" for t, s in not_approved.items())
+    return check
+
+
+def check_record_count(handover: Handover) -> Check:
+    check = Check("Record count", "Handover CSV files",
+                  "Row count of each CSV = records_output in the transformation log",
+                  CRITICAL)
+    bad = [f"{t}: csv={item.row_count} log={item.records_output}"
+           for t, item in handover.tables.items()
+           if item.records_output is None or item.row_count != item.records_output]
+    if bad:
+        check.status, check.detail = "FAIL", "; ".join(bad)
+    else:
+        check.detail = f"{handover.total_rows} rows match the transformation log"
+    return check
+
+
+def check_file_integrity(handover: Handover) -> Check:
+    check = Check("File integrity", "Handover CSV files",
+                  "SHA-256 of each CSV = checksum in the transformation log", CRITICAL)
+    bad = [t for t, item in handover.tables.items()
+           if not item.checksum or item.checksum != item.expected_checksum]
+    if bad:
+        check.status = "FAIL"
+        check.detail = "checksum missing or different for: " + ", ".join(bad)
+    else:
+        check.detail = "all checksums match"
+    return check
+
+
+def _target_columns(cur) -> dict[str, dict[str, str]]:
+    cur.execute(
+        """
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = ANY(%s)
+        ORDER BY table_name, ordinal_position
+        """,
+        (WAREHOUSE_SCHEMA, list(LOAD_ORDER)),
+    )
+    found: dict[str, dict[str, str]] = {}
+    for table, column, data_type in cur.fetchall():
+        found.setdefault(table, {})[column] = data_type
+    return found
+
+
+def check_schema_match(handover: Handover, cur) -> Check:
+    check = Check("Schema match", "All target tables",
+                  "All handover columns exist in the target with expected types; "
+                  "no missing or extra columns", CRITICAL)
+    target = _target_columns(cur)
+    problems: list[str] = []
+    for table, item in handover.tables.items():
+        if item.header and item.columns and item.header != item.columns:
+            problems.append(f"{table}: CSV header differs from its .schema.json")
+        columns = target.get(table)
+        if not columns:
+            problems.append(f"{table}: table {WAREHOUSE_SCHEMA}.{table} not found")
+            continue
+        handover_cols = set(item.header or item.columns)
+        target_cols = set(columns) - set(LOAD_COLUMNS)
+        if handover_cols:
+            missing = sorted(handover_cols - target_cols)
+            extra = sorted(target_cols - handover_cols)
+            if missing:
+                problems.append(f"{table}: not in target {missing}")
+            if extra:
+                problems.append(f"{table}: not in handover {extra}")
+        missing_load_cols = [c for c in LOAD_COLUMNS if c not in columns]
+        if missing_load_cols:
+            problems.append(f"{table}: load columns missing {missing_load_cols}")
+        wrong = [f"{c} is {columns[c]}, expected {expected}"
+                 for c, expected in EXPECTED_TYPES[table].items()
+                 if c in columns and columns[c] != expected]
+        if wrong:
+            problems.append(f"{table}: " + "; ".join(wrong))
+    if problems:
+        check.status, check.detail = "FAIL", " | ".join(problems)
+    else:
+        check.detail = "5 tables match the handover columns and expected types"
+    return check
+
+
+def check_write_permission(cur) -> Check:
+    check = Check("Write permission", f"{WAREHOUSE_SCHEMA} schema, load role",
+                  "Role can INSERT and UPDATE all five tables, INSERT into load_log, "
+                  "and create temporary tables", CRITICAL)
+    wanted = [(t, p) for t in LOAD_ORDER for p in ("INSERT", "UPDATE")]
+    wanted += [("load_log", "INSERT"), ("load_log", "SELECT")]
+    missing: list[str] = []
+    for table, privilege in wanted:
+        qualified = f"{WAREHOUSE_SCHEMA}.{table}"
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (qualified,))
+        if not cur.fetchone()[0]:
+            missing.append(f"{qualified} does not exist")
+            continue
+        cur.execute("SELECT has_table_privilege(current_user, %s, %s)", (qualified, privilege))
+        if not cur.fetchone()[0]:
+            missing.append(f"{privilege} on {qualified}")
+    cur.execute("SELECT has_database_privilege(current_user, current_database(), 'TEMP')")
+    if not cur.fetchone()[0]:
+        missing.append("TEMP on the database")
+    if missing:
+        check.status = "FAIL"
+        check.detail = "missing: " + ", ".join(dict.fromkeys(missing))
+    else:
+        check.detail = "all required privileges present"
+    return check
+
+
+def check_duplicate_batch(handover: Handover, cur, force_reload: bool) -> Check:
+    check = Check("Duplicate batch", f"{WAREHOUSE_SCHEMA}.load_log.batch_id",
+                  "Batch ID not previously loaded with SUCCESS", CRITICAL)
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"{WAREHOUSE_SCHEMA}.load_log",))
+    if not cur.fetchone()[0]:
+        check.status, check.detail = "FAIL", f"{WAREHOUSE_SCHEMA}.load_log does not exist"
+        return check
+    cur.execute(
+        f"SELECT count(DISTINCT run_id), max(load_end_ts) FROM {WAREHOUSE_SCHEMA}.load_log "
+        "WHERE batch_id = %s AND status = 'SUCCESS'",
+        (handover.batch_id,),
+    )
+    runs, last_end = cur.fetchone()
+    if not runs:
+        check.detail = f"{handover.batch_id} has not been loaded before"
+    elif force_reload:
+        check.detail = (f"{handover.batch_id} already loaded {runs} time(s), last at "
+                        f"{last_end}; reloading because --force-reload was given")
+    else:
+        check.status = "FAIL"
+        check.detail = (f"{handover.batch_id} already loaded with SUCCESS (last at {last_end}). "
+                        "Use --force-reload to load it again on purpose")
+    return check
+
+
+def _storage_limit_mb() -> int:
+    try:
+        return int(os.environ.get("WAREHOUSE_STORAGE_LIMIT_MB", STORAGE_LIMIT_MB_DEFAULT))
+    except ValueError:
+        return STORAGE_LIMIT_MB_DEFAULT
+
+
+def check_storage(cur) -> list[Check]:
+    limit_mb = _storage_limit_mb()
+    fail_check = Check("Storage space", "Warehouse database size",
+                       f"Used space is below {STORAGE_FAIL_PCT}% of the {limit_mb} MB limit",
+                       CRITICAL)
+    warn_check = Check("Storage warning", "Warehouse database size",
+                       f"Used space is below {STORAGE_WARN_PCT}% of the {limit_mb} MB limit",
+                       NON_CRITICAL)
+    cur.execute("SELECT pg_database_size(current_database())")
+    used_mb = cur.fetchone()[0] / (1024 * 1024)
+    used_pct = used_mb / limit_mb * 100 if limit_mb > 0 else 0.0
+    detail = f"{used_mb:.1f} MB of {limit_mb} MB used ({used_pct:.1f}%)"
+    fail_check.detail = warn_check.detail = detail
+    if used_pct >= STORAGE_FAIL_PCT:
+        fail_check.status = "FAIL"
+    if used_pct >= STORAGE_WARN_PCT:
+        warn_check.status = "WARNING"
+    return [fail_check, warn_check]
+
+
+# Checks that need the warehouse; reported as NOT RUN when it is unreachable.
+_DB_CHECKS = (
+    ("Write permission", f"{WAREHOUSE_SCHEMA} schema, load role"),
+    ("Schema match", "All target tables"),
+    ("Duplicate batch", f"{WAREHOUSE_SCHEMA}.load_log.batch_id"),
+    ("Storage space", "Warehouse database size"),
+    ("Storage warning", "Warehouse database size"),
+)
+
+
+def run_pre_load_checks(handover: Handover, dsn: str | None, *,
+                        force_reload: bool = False,
+                        released_by: str | None = None) -> tuple[list[Check], Any]:
+    """Run every Section 4 check. Reads only; writes nothing.
+
+    Returns the checks and the open warehouse connection (None when the
+    connection failed), so the load can reuse it.
+    """
+    connection_check, conn = check_target_connection(dsn)
+    checks = [
+        connection_check,
+        check_handover_completeness(handover),
+        check_handover_status(handover, released_by),
+        check_record_count(handover),
+        check_file_integrity(handover),
+    ]
+    if conn is None:
+        for name, target in _DB_CHECKS:
+            severity = NON_CRITICAL if name == "Storage warning" else CRITICAL
+            checks.append(Check(name, target, "", severity, "NOT RUN",
+                                "warehouse not reachable"))
+        return checks, None
+    try:
+        with conn.cursor() as cur:
+            checks.append(check_write_permission(cur))
+            checks.append(check_schema_match(handover, cur))
+            checks.append(check_duplicate_batch(handover, cur, force_reload))
+            checks.extend(check_storage(cur))
+    except Exception as exc:  # noqa: BLE001 - a query error is a failed check
+        checks.append(Check("Pre-load query", "Warehouse database",
+                            "Pre-load queries run without errors", CRITICAL, "FAIL",
+                            mask(f"{type(exc).__name__}: {str(exc).strip()}", dsn)))
+    finally:
+        conn.rollback()  # end the read-only transaction; nothing was written
+    return checks, conn
+
+
+def summarize_checks(checks: list[Check]) -> str:
+    """`PASS`, or the names of the checks that did not pass (load_log.pre_load_result)."""
+    bad = [f"{c.status}: {c.name}" for c in checks if c.status != "PASS"]
+    return "PASS" if not bad else "; ".join(bad)
+
+
+def decide(checks: list[Check]) -> str:
+    """docs/load.md Section 8: any critical FAIL -> REJECTED, any WARNING -> MANUAL REVIEW."""
+    if any(c.status in ("FAIL", "NOT RUN") and c.severity == CRITICAL for c in checks):
+        return "REJECTED"
+    if any(c.status in ("WARNING", "NOT RUN") for c in checks):
+        return "MANUAL REVIEW"
+    return "APPROVED"
+
+
+def print_checks(title: str, checks: list[Check]) -> None:
+    log(title)
+    width = max(len(c.name) for c in checks)
+    for c in checks:
+        log(f"  {c.status:<8} {c.name:<{width}}  [{c.severity}] {c.detail}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -293,6 +763,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-date", default=None,
                         help="transformation run date to load, YYYY-MM-DD (default: newest)")
     parser.add_argument("--run-id", default=None, help="load run_id (default: auto ww-load-...)")
+    parser.add_argument("--force-reload", action="store_true",
+                        help="load a batch that was already loaded with SUCCESS")
+    parser.add_argument("--handover-released-by", default=None, metavar="NAME",
+                        help="reviewer who released a transformation batch on MANUAL REVIEW")
     parser.add_argument("--transformed-root", default=None,
                         help="handover root (default transformed/)")
     parser.add_argument("--transformation-log-root", default=None,
@@ -323,10 +797,24 @@ def main(argv: list[str] | None = None) -> int:
     log(f"Run {run_id} | load_code_version={LOAD_CODE_VERSION}")
     describe_handover(handover)
 
-    if handover.problems:
-        log(f"Handover incomplete: {len(handover.problems)} problem(s). Nothing loaded.")
+    checks, conn = run_pre_load_checks(
+        handover, get_warehouse_dsn(),
+        force_reload=args.force_reload,
+        released_by=args.handover_released_by,
+    )
+    if conn is not None:
+        conn.close()
+    print_checks("Pre-load validation checks (docs/load.md Section 4):", checks)
+
+    decision = decide(checks)
+    log(f"pre_load_result = {summarize_checks(checks)}")
+    if decision == "REJECTED":
+        log("REJECTED: a critical pre-load check failed. Nothing was written to the warehouse.")
         return 1
-    log(f"Handover read: {handover.total_rows} row(s) in {len(handover.tables)} table(s).")
+    if decision == "MANUAL REVIEW":
+        log("Pre-load WARNING: no critical failure, but a non-critical check needs review.")
+        return 3
+    log(f"Pre-load PASS: {handover.batch_id} is ready to load ({handover.total_rows} rows).")
     return 0
 
 
