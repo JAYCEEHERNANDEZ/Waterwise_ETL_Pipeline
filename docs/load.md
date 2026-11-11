@@ -147,7 +147,7 @@ All tables are in the `warehouse` schema. Column names and types follow the tran
 - **Transaction and Rollback Handling**
   - The **whole batch** (all five tables and the post-load checks) is loaded in **one transaction**.
   - The transaction is committed only when the batch is accepted (Section 8). Otherwise it is rolled back, so the warehouse is left exactly as it was before the run and no partial data remains. If the process or connection dies, PostgreSQL discards the open transaction.
-  - `load_log` rows are written on a separate connection, so failed runs are still recorded.
+  - `load_log` rows of an accepted batch are written inside the same transaction, so the data and its log are committed together. A held or failed batch writes its `load_log` rows on a separate connection after the rollback, so it is still recorded.
 - **Rerun and Idempotency**
   - Running the same batch twice does not create duplicates or inflate totals, because the upsert matches on the natural key and writes the same values to the same rows.
   - Reruns and recovery: a failed batch left nothing behind, so it is fixed and run again (merge on key). The duplicate batch check stops a batch that already succeeded; an intentional reload uses `--force-reload`.
@@ -224,7 +224,7 @@ One record is written per target table per load run.
 | `records_inserted` | New rows written | `210` |
 | `records_updated` | Existing rows changed | `12,185` |
 | `records_rejected` | Rows that failed to load | `0` |
-| `status` | Result of the load | `SUCCESS` |
+| `status` | Result of the load: `SUCCESS` (committed), `HELD` (manual review, rolled back), or `FAILED` (rejected, rolled back) | `SUCCESS` |
 | `pre_load_result` | Outcome of the pre-load checks | `PASS` |
 | `post_load_result` | Outcome of the post-load checks | `PASS` |
 | `error_code` | Failure or rejection reason, if any | `NULL` |
