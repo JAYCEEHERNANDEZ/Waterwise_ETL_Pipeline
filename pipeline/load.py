@@ -45,8 +45,9 @@ Usage:
 Exit codes:
     0 = APPROVED (committed; with --dry-run: would be committed)
     3 = MANUAL REVIEW (rolled back, waiting for --accept-warnings)
-    1 = REJECTED (rolled back)
+    1 = REJECTED (rolled back; a data or contract problem, do not retry)
     2 = usage / input error (no handover to read)
+    4 = REJECTED because the warehouse could not be reached (safe to retry)
 
 Tests: python -m unittest discover -s tests -v
 """
@@ -1509,6 +1510,22 @@ def write_quarantine(run_id: str, handover: Handover, results: dict[str, TableRe
     return path, len(rejected)
 
 
+EXIT_RETRY = 4
+
+
+def is_transient(message: str | None) -> bool:
+    """A connection problem that a later retry can fix (docs/load.md Section 8).
+
+    A wrong password is not transient: retrying only makes the Supabase pooler
+    block the IP for longer. A pooler block (ECIRCUITBREAKER) is transient: it
+    clears by itself within minutes, and retries are 5 minutes apart.
+    """
+    if not message:
+        return False
+    return (message.startswith(("OperationalError", "InterfaceError"))
+            and "authentication failed" not in message)
+
+
 def table_result_label(r: TableResult | None, load_error: str | None) -> str:
     if r is None or load_error:
         return "FAIL"
@@ -1680,6 +1697,12 @@ def main(argv: list[str] | None = None) -> int:
             "Super Admin. Review the checks above and the rejected-records file, then rerun "
             'with --accept-warnings "<reviewer>" to publish.')
         return 3
+    connection = next((c for c in checks if c.name == "Target connection"), None)
+    if is_transient(load_error) or (connection and connection.status == "FAIL"
+                                    and is_transient(connection.detail)):
+        log("REJECTED: the warehouse could not be reached. Nothing was published; "
+            "safe to retry (docs/load.md Section 8: up to 3 retries, 5 minutes apart).")
+        return EXIT_RETRY
     log("REJECTED: rolled back, nothing was published. Fix the cause, then rerun the "
         "same batch.")
     return 1

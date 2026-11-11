@@ -2,6 +2,8 @@
 pipeline/.env
 .env
 rawdata/
+transformed/
+quarantine/
 logs/
 __pycache__/
 *.pyc
