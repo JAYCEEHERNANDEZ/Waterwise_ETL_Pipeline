@@ -1,6 +1,6 @@
 # WaterWise Airflow on Docker — setup guide
 
-Runs two DAGs:
+Runs three DAGs:
 
 | DAG | File | Schedule (Asia/Manila) |
 | --- | --- | --- |
