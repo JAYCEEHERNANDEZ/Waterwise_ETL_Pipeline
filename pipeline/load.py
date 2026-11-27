@@ -61,6 +61,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -72,7 +73,7 @@ from urllib.parse import unquote, urlsplit
 try:
     from dotenv import load_dotenv
     _HERE = Path(__file__).resolve().parent
-    # Same order as stage.py: pipeline/.env first, then the repo-root .env.
+    # Same order as extract.py: pipeline/.env first, then the repo-root .env.
     load_dotenv(_HERE / ".env")
     load_dotenv(_HERE.parent / ".env")
 except ImportError:  # pragma: no cover - environment variables still work
@@ -93,6 +94,7 @@ TRANSFORMED_ROOT = BASE_DIR / "transformed"
 TRANSFORMATION_LOG_ROOT = BASE_DIR / "logs" / "waterwise-transformation"
 LOAD_LOG_ROOT = BASE_DIR / "logs" / "waterwise-load"
 QUARANTINE_ROOT = BASE_DIR / "quarantine" / "load"
+LOADED_ROOT = BASE_DIR / "loaded"
 
 LOAD_CODE_VERSION = "v1.0"
 WAREHOUSE_SCHEMA = "warehouse"
@@ -135,7 +137,10 @@ EXPECTED_TYPES: dict[str, dict[str, str]] = {
         "consumption_key": _CHAR, "consumption_id": _INT, "consumer_key": _CHAR,
         "reading_date": _DATE, "reading_year": _SMALLINT, "reading_month": _SMALLINT,
         "billing_period": _CHAR, "previous_reading": _NUM, "present_reading": _NUM,
-        "consumption": _NUM, "consumption_cbm": _NUM, "days_in_period": _INT,
+        "consumption": _NUM, "reading_source": _VARCHAR,
+        "carried_consumption": _NUM, "prior_usage_basis": _VARCHAR,
+        "new_baseline": _NUM, "meter_incident_id": _INT,
+        "consumption_cbm": _NUM, "days_in_period": _INT,
         "consumption_per_day": _NUM, "reading_date_adjusted": _BOOL,
         "transformation_run_id": _VARCHAR,
     },
@@ -1113,7 +1118,9 @@ AMOUNT_COLUMNS = {
     "fact_payment": "total_paid",
 }
 OPTIONAL_COLUMNS = {
-    "dim_consumer": ("contact_number", "middle_name"),
+    # A consumer may legitimately have no middle name, including the whole
+    # source population, so it must not hold an otherwise valid scheduled load.
+    "dim_consumer": ("contact_number",),
     "fact_payment": ("reference_number",),
 }
 
@@ -1510,6 +1517,39 @@ def write_quarantine(run_id: str, handover: Handover, results: dict[str, TableRe
     return path, len(rejected)
 
 
+def write_loaded_csvs(handover: Handover, results: dict[str, TableResult],
+                      loaded_root: Path) -> list[Path]:
+    """Export the rows accepted by a committed load, excluding rejected rows."""
+    paths: list[Path] = []
+    for table in LOAD_ORDER:
+        item = handover.tables[table]
+        rejected_rows = {row.row_no for row in results[table].rejected}
+        folder = loaded_root / table / handover.run_date
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{table}_{handover.run_date}.csv"
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", newline="", encoding="utf-8", delete=False,
+                dir=folder, prefix=f".{path.name}.", suffix=".tmp",
+            ) as handle:
+                temporary_path = Path(handle.name)
+                writer = csv.DictWriter(handle, fieldnames=item.header,
+                                        lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(
+                    row for row_no, row in enumerate(item.rows, start=1)
+                    if row_no not in rejected_rows
+                )
+            temporary_path.replace(path)
+        except Exception:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+        paths.append(path)
+    return paths
+
+
 EXIT_RETRY = 4
 
 
@@ -1571,9 +1611,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="load JSON log root (default logs/waterwise-load/)")
     parser.add_argument("--quarantine-root", default=None,
                         help="rejected-records root (default quarantine/load/)")
+    parser.add_argument("--loaded-root", default=None,
+                        help="successfully loaded CSV root (default loaded/)")
     parser.add_argument("--dry-run", action="store_true",
                         help="run every check and the full load, then roll back; writes "
-                             "nothing (no data, no load_log, no JSON log, no quarantine)")
+                             "nothing (no data, loaded CSV, load_log, JSON log, or quarantine)")
     return parser.parse_args(argv)
 
 
@@ -1588,6 +1630,7 @@ def main(argv: list[str] | None = None) -> int:
     run_id = args.run_id or new_run_id()
     log_root = Path(args.log_root) if args.log_root else LOAD_LOG_ROOT
     quarantine_root = Path(args.quarantine_root) if args.quarantine_root else QUARANTINE_ROOT
+    loaded_root = Path(args.loaded_root) if args.loaded_root else LOADED_ROOT
     if args.accept_warnings is not None and not args.accept_warnings.strip():
         print("--accept-warnings needs the reviewer's name", file=sys.stderr)
         return 2
@@ -1688,6 +1731,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print_summary(results, load_error, decision, status, reviewed_by)
     if committed:
+        try:
+            loaded_paths = write_loaded_csvs(handover, results, loaded_root)
+            log(f"Loaded CSVs: {len(loaded_paths)} file(s) -> {loaded_root}")
+        except Exception as exc:  # the warehouse commit must not be retried
+            log(f"WARNING: warehouse commit succeeded, but loaded CSV export failed: {exc}")
         log(f"APPROVED: {handover.batch_id} committed and published "
             f"(transformation run {handover.transformation_run_id}). "
             f"{WAREHOUSE_SCHEMA}.latest_successful_load now shows this batch.")

@@ -31,7 +31,7 @@ services:
       AIRFLOW__WEBSERVER__SECRET_KEY: 4796c9a0a6a071a080e5d8e21fbf1dec
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Manila
-      # Runtime deps for pipeline/stage.py (installed at container start).
+      # Runtime deps for pipeline/extract.py (installed at container start).
       _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas python-dotenv"
     # DB credentials (server-side only, never frontend): WATERWISE_DB_URL for the
     # extraction job, WAREHOUSE_DB_URL (role etl_loader) for the load job.
@@ -39,14 +39,15 @@ services:
       - ./pipeline/.env
     volumes:
       # DAG file + pipeline package. Airflow adds the dags folder to
-      # sys.path, so `from pipeline.stage import main` resolves.
+      # sys.path, so `from pipeline.extract import main` resolves.
       - ./pipeline:/opt/airflow/dags/pipeline
-      # stage.py computes these paths from its own location
+      # extract.py computes these paths from its own location
       # (BASE_DIR = <dags>/pipeline/.. = /opt/airflow/dags).
       - ./rawdata:/opt/airflow/dags/rawdata
       - ./logs:/opt/airflow/dags/logs
       # Transformation handover (read by the load) and rejected records.
       - ./transformed:/opt/airflow/dags/transformed
+      - ./loaded:/opt/airflow/dags/loaded
       - ./quarantine:/opt/airflow/dags/quarantine
     restart: unless-stopped
 

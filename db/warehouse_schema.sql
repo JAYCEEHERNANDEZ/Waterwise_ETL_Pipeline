@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS warehouse.fact_consumption (
     previous_reading       NUMERIC(12,2)  NOT NULL,
     present_reading        NUMERIC(12,2)  NOT NULL,
     consumption            NUMERIC(12,2)  NOT NULL CHECK (consumption >= 0),
+    reading_source         VARCHAR(16)     NOT NULL DEFAULT 'actual',
+    carried_consumption    NUMERIC(12,2)  NOT NULL DEFAULT 0,
+    prior_usage_basis      VARCHAR(32),
+    new_baseline           NUMERIC(12,2),
+    meter_incident_id      INTEGER,
     consumption_cbm        NUMERIC(12,2)  NOT NULL,
     days_in_period         INTEGER        NOT NULL,
     consumption_per_day    NUMERIC(12,4)  NOT NULL,
@@ -88,9 +93,53 @@ CREATE TABLE IF NOT EXISTS warehouse.fact_consumption (
     -- added by the load stage
     load_batch_id          VARCHAR(64)    NOT NULL,
     loaded_at              TIMESTAMPTZ    NOT NULL DEFAULT now(),
-    CONSTRAINT fact_consumption_reading_order
-        CHECK (present_reading >= previous_reading)
+    CONSTRAINT fact_consumption_reading_order CHECK (
+        reading_source = 'incident' OR present_reading >= previous_reading
+    ),
+    CONSTRAINT fact_consumption_incident_provenance CHECK (
+        reading_source <> 'incident' OR (
+            meter_incident_id IS NOT NULL
+            AND new_baseline IS NOT NULL
+            AND present_reading >= new_baseline
+            AND abs(consumption - (
+                carried_consumption + present_reading - new_baseline
+            )) <= 0.01
+        )
+    )
 );
+
+-- Upgrade an existing warehouse created before incident-aware meter readings.
+-- Existing facts remain ordinary `actual` readings with zero carried usage.
+ALTER TABLE warehouse.fact_consumption
+    ADD COLUMN IF NOT EXISTS reading_source VARCHAR(16) NOT NULL DEFAULT 'actual',
+    ADD COLUMN IF NOT EXISTS carried_consumption NUMERIC(12,2) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS prior_usage_basis VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS new_baseline NUMERIC(12,2),
+    ADD COLUMN IF NOT EXISTS meter_incident_id INTEGER;
+
+ALTER TABLE warehouse.fact_consumption
+    DROP CONSTRAINT IF EXISTS fact_consumption_reading_source_check,
+    DROP CONSTRAINT IF EXISTS fact_consumption_carried_non_negative,
+    DROP CONSTRAINT IF EXISTS fact_consumption_reading_order,
+    DROP CONSTRAINT IF EXISTS fact_consumption_incident_provenance;
+
+ALTER TABLE warehouse.fact_consumption
+    ADD CONSTRAINT fact_consumption_reading_source_check
+        CHECK (reading_source IN ('actual', 'estimated', 'incident')),
+    ADD CONSTRAINT fact_consumption_carried_non_negative
+        CHECK (carried_consumption >= 0),
+    ADD CONSTRAINT fact_consumption_reading_order
+        CHECK (reading_source = 'incident' OR present_reading >= previous_reading),
+    ADD CONSTRAINT fact_consumption_incident_provenance CHECK (
+        reading_source <> 'incident' OR (
+            meter_incident_id IS NOT NULL
+            AND new_baseline IS NOT NULL
+            AND present_reading >= new_baseline
+            AND abs(consumption - (
+                carried_consumption + present_reading - new_baseline
+            )) <= 0.01
+        )
+    );
 
 CREATE TABLE IF NOT EXISTS warehouse.fact_billing (
     billing_key             CHAR(16)       PRIMARY KEY,

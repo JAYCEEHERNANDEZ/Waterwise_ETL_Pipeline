@@ -64,7 +64,7 @@ OUTPUT_ROOT = BASE_DIR / "transformed"
 LOG_ROOT = BASE_DIR / "logs" / "waterwise-transformation"
 QUARANTINE_ROOT = BASE_DIR / "quarantine" / "transformation"
 
-RULES_VERSION = "1.0"
+RULES_VERSION = "1.1"
 
 # Asia/Manila (PHT, UTC+8, no DST). Fixed offset avoids a tzdata dependency.
 PHT = timezone(timedelta(hours=8))
@@ -89,7 +89,9 @@ EXPECTED_INPUT_COLUMNS: dict[str, list[str]] = {
     ],
     "consumption": [
         "id", "consumer_id", "reading_date", "previous_reading",
-        "present_reading", "consumption", "idempotency_key",
+        "present_reading", "consumption", "reading_source",
+        "carried_consumption", "prior_usage_basis", "new_baseline",
+        "meter_incident_id", "idempotency_key",
         "created_at", "updated_at",
     ],
     "billing": [
@@ -124,6 +126,8 @@ OUTPUT_COLUMNS: dict[str, list[str]] = {
         "consumption_key", "consumption_id", "consumer_key", "reading_date",
         "reading_year", "reading_month", "billing_period",
         "previous_reading", "present_reading", "consumption",
+        "reading_source", "carried_consumption", "prior_usage_basis",
+        "new_baseline", "meter_incident_id",
         "consumption_cbm", "days_in_period", "consumption_per_day",
         "reading_date_adjusted", "transformation_run_id",
     ],
@@ -161,6 +165,7 @@ REQUIRED_NOT_NULL: dict[str, list[str]] = {
         "consumption_key", "consumption_id", "consumer_key", "reading_date",
         "reading_year", "reading_month", "billing_period",
         "previous_reading", "present_reading", "consumption",
+        "reading_source", "carried_consumption",
         "consumption_cbm", "days_in_period", "consumption_per_day",
         "reading_date_adjusted", "transformation_run_id",
     ],
@@ -198,6 +203,7 @@ PAYMENT_METHOD_MAP = {
 }
 CODE_DOMAIN: dict[tuple[str, str], set[str]] = {
     ("dim_consumer", "status"): {"ACTIVE", "INACTIVE", "UNKNOWN"},
+    ("fact_consumption", "reading_source"): {"actual", "estimated", "incident"},
     ("fact_billing", "status"): {"PAID", "PARTIAL", "UNPAID", "UNKNOWN"},
     ("fact_payment", "payment_method"): {"CASH", "GCASH", "BANK_TRANSFER", "OTHER"},
     ("fact_billing", "overdue_bucket"): {
@@ -208,7 +214,7 @@ CODE_DOMAIN: dict[tuple[str, str], set[str]] = {
 TEXT_COLUMNS = {
     "consumers": ["username", "first_name", "middle_name", "last_name",
                   "email", "contact_number", "status"],
-    "consumption": [],
+    "consumption": ["reading_source", "prior_usage_basis"],
     "billing": ["status"],
     "payments": ["payment_method", "reference_number"],
 }
@@ -515,7 +521,10 @@ def profile(table: str, rows: list[dict[str, str]]) -> dict[str, int]:
         for row in rows:
             prev, pres = dec(row.get("previous_reading")), dec(row.get("present_reading"))
             if prev is not None and pres is not None and pres < prev:
-                bump("P-08_negative_consumption")
+                if (normalize_text(row.get("reading_source")) or "actual").lower() == "incident":
+                    bump("P-08_meter_incident_reset")
+                else:
+                    bump("P-08_unexplained_reading_drop")
         seen: dict[tuple[int, int, int], int] = {}
         for row in rows:
             cid, reading = to_int(row.get("consumer_id")), parse_date(row.get("reading_date"))
@@ -775,8 +784,9 @@ def build_dim_consumer(consumers: list[dict[str, str]], ctx: Context) -> list[di
             row.get("status"), STATUS_MAP_CONSUMER, "UNKNOWN", ctx)
         record["code_unmapped"] = to_bool(status_unmapped)
         # X-01: inactive consumers are flagged, never removed.
-        record["active_flag"] = to_bool(record["status"] == "ACTIVE")
-        if not record["active_flag"]:
+        is_active = record["status"] == "ACTIVE"
+        record["active_flag"] = to_bool(is_active)
+        if not is_active:
             ctx.exclude("X-01")
         out.append(record)
     return out
@@ -806,6 +816,12 @@ def build_fact_consumption(consumption: list[dict[str, str]],
         prev = dec(row.get("previous_reading"))
         pres = dec(row.get("present_reading"))
         cons = dec(row.get("consumption"))
+        reading_source = (normalize_text(row.get("reading_source")) or "actual").lower()
+        carried = dec(row.get("carried_consumption"))
+        carried = Decimal("0") if carried is None else carried
+        prior_usage_basis = normalize_text(row.get("prior_usage_basis")) or None
+        new_baseline = dec(row.get("new_baseline"))
+        meter_incident_id = to_int(row.get("meter_incident_id"))
         if cid is None:
             ctx.reject("consumption", row, "C-10", "unparseable consumption id")
             continue
@@ -815,8 +831,32 @@ def build_fact_consumption(consumption: list[dict[str, str]],
         if prev is None or pres is None or cons is None:
             ctx.reject("consumption", row, "S-06", "unparseable numeric reading")
             continue
-        # C-05: physically impossible readings are rejected, not cleaned.
-        if pres < prev:
+        if reading_source not in {"actual", "estimated", "incident"}:
+            ctx.reject("consumption", row, "C-05",
+                       f"unsupported reading_source {reading_source!r}")
+            continue
+        # A falling cumulative reading is valid only when the source explicitly
+        # links it to the incident workflow. The source's stored consumption is
+        # authoritative and must match carried usage plus the new-meter delta.
+        if reading_source == "incident":
+            if meter_incident_id is None or new_baseline is None:
+                ctx.reject("consumption", row, "C-05",
+                           "incident reading missing meter_incident_id or new_baseline")
+                continue
+            if carried < 0 or pres < new_baseline:
+                ctx.reject("consumption", row, "C-05",
+                           "incident carried usage/baseline produces a negative reading")
+                continue
+            expected_incident_consumption = carried + (pres - new_baseline)
+            if abs(cons - expected_incident_consumption) > MONEY_Q:
+                ctx.reject(
+                    "consumption", row, "C-05",
+                    f"incident consumption {cons} != carried {carried} + "
+                    f"(present {pres} - baseline {new_baseline})",
+                )
+                continue
+            ctx.tally("C-05_INCIDENT_ACCEPTED")
+        elif pres < prev:
             ctx.reject("consumption", row, "C-05",
                        f"present_reading {pres} < previous_reading {prev}")
             continue
@@ -842,6 +882,11 @@ def build_fact_consumption(consumption: list[dict[str, str]],
             "previous_reading": money(prev),
             "present_reading": money(pres),
             "consumption": money(cons),
+            "reading_source": reading_source,
+            "carried_consumption": money(carried),
+            "prior_usage_basis": prior_usage_basis,
+            "new_baseline": money(new_baseline) if new_baseline is not None else None,
+            "meter_incident_id": meter_incident_id,
             "consumption_cbm": money(cons),                                  # B-04
             "days_in_period": dim,                                           # B-05
             "consumption_per_day": rate(cons / Decimal(dim)),                # B-06
@@ -1236,7 +1281,8 @@ def validate(outputs: dict[str, list[dict[str, Any]]],
 
     # V-08 non-negative measures
     numeric_spec = [
-        ("fact_consumption", ["previous_reading", "present_reading", "consumption", "consumption_cbm"]),
+        ("fact_consumption", ["previous_reading", "present_reading", "consumption",
+                              "carried_consumption", "new_baseline", "consumption_cbm"]),
         ("fact_billing", ["total_bill", "remaining_balance"]),
         ("fact_payment", ["total_paid", "amount_tendered", "change_given", "remaining_balance"]),
     ]
@@ -1246,13 +1292,19 @@ def validate(outputs: dict[str, list[dict[str, Any]]],
         add("V-08", "Business rule - non-negative measures", output, "critical",
             negatives == 0, f"{negatives} negative value(s)")
 
-    # V-09 meter monotonicity
+    # V-09 meter continuity. A decrease is valid only with incident provenance.
     bad_readings = sum(
         1 for r in outputs.get("fact_consumption", [])
-        if dec(r["present_reading"]) < dec(r["previous_reading"])
+        if (dec(r["present_reading"]) < dec(r["previous_reading"])
+            and r.get("reading_source") != "incident")
     )
-    add("V-09", "Business rule - reading monotonicity", "fact_consumption", "critical",
-        bad_readings == 0, f"{bad_readings} violation(s)")
+    incident_readings = sum(
+        1 for r in outputs.get("fact_consumption", [])
+        if r.get("reading_source") == "incident"
+    )
+    add("V-09", "Business rule - meter continuity", "fact_consumption", "critical",
+        bad_readings == 0,
+        f"{bad_readings} unexplained decrease(s); {incident_readings} incident reading(s)")
 
     # V-10 cash reconciliation identity
     bad_cash = 0
@@ -1845,7 +1897,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Validate (Section 7) ---
     prior_checksums: dict[str, str] = {}
-    for payload in _prior_runs(run_id):
+    for payload in _prior_runs(run_id, run_date, args.rules_version):
         for name, checksum in (payload.get("output_content_checksums") or {}).items():
             prior_checksums.setdefault(name, checksum)
     if args.no_write:
@@ -1945,7 +1997,7 @@ def time_marker() -> str:
     return f"{datetime.now(PHT).isoformat()}-{os.getpid()}"
 
 
-def _prior_runs(run_id: str) -> list[dict[str, Any]]:
+def _prior_runs(run_id: str, run_date: str, rules_version: str) -> list[dict[str, Any]]:
     """Earlier run logs for the same batch, used by the V-22 idempotency check."""
     payloads: list[dict[str, Any]] = []
     if not LOG_ROOT.exists():
@@ -1955,7 +2007,10 @@ def _prior_runs(run_id: str) -> list[dict[str, Any]]:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        if payload.get("run_id") != run_id:
+        payload_date = str(payload.get("batch_window_start") or "")[:10]
+        if (payload.get("run_id") != run_id
+                and payload_date == run_date
+                and payload.get("rules_version") == rules_version):
             payloads.append(payload)
     return payloads
 

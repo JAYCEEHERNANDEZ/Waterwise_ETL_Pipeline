@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from pipeline import load as L          # noqa: E402
+from pipeline import extract as S       # noqa: E402
 from pipeline import transform as T     # noqa: E402
 
 RUN_DATE = "2026-03-10"
@@ -197,6 +198,123 @@ class ValueAndMaskingTests(unittest.TestCase):
         self.assertEqual(L.mask_pii("contact_number", "09171234567"), "09***4567")
 
 
+class LoadedCsvTests(unittest.TestCase):
+
+    def test_writes_only_successfully_loaded_rows(self):
+        h = handover()
+        results = {}
+        for table, item in h.tables.items():
+            result = L.TableResult(table=table, started_at=L.datetime.now(L.PHT),
+                                   received=item.row_count)
+            result.inserted = item.row_count
+            results[table] = result
+
+        rejected_item = h.tables["fact_payment"]
+        results["fact_payment"].rejected.append(L.RejectedRow(
+            "fact_payment", 1, None, "test rejection", rejected_item.rows[0]))
+        output = TMP / "loaded_csv_test"
+
+        paths = L.write_loaded_csvs(h, results, output)
+
+        self.assertEqual(len(paths), len(L.LOAD_ORDER))
+        for table, path in zip(L.LOAD_ORDER, paths):
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(L.csv.DictReader(handle))
+            expected = h.tables[table].row_count - (1 if table == "fact_payment" else 0)
+            self.assertEqual(len(rows), expected)
+
+
+class TransformationPriorRunTests(unittest.TestCase):
+
+    def test_idempotency_uses_only_prior_runs_from_same_date(self):
+        root = TMP / "prior_run_logs"
+        root.mkdir(parents=True, exist_ok=True)
+        current = "ww-transform-2026-03-10-1200-current"
+        samples = [
+            ("same", "ww-transform-2026-03-10-1100-old", "2026-03-10"),
+            ("other-version", "ww-transform-2026-03-10-1000-old", "2026-03-10"),
+            ("other", "ww-transform-2026-03-09-1100-old", "2026-03-09"),
+            ("current", current, "2026-03-10"),
+        ]
+        for name, run_id, run_date in samples:
+            payload = {
+                "run_id": run_id,
+                "batch_window_start": f"{run_date}T00:00:00+08:00",
+                "rules_version": "1.1" if name != "other-version" else "1.0",
+                "output_content_checksums": {"dim_consumer": name},
+            }
+            (root / f"{name}_dim_consumer.json").write_text(
+                L.json.dumps(payload), encoding="utf-8")
+
+        with mock.patch.object(T, "LOG_ROOT", root):
+            prior = T._prior_runs(current, "2026-03-10", "1.1")
+
+        self.assertEqual([item["run_id"] for item in prior],
+                         ["ww-transform-2026-03-10-1100-old"])
+
+
+class MeterIncidentTests(unittest.TestCase):
+
+    def incident_row(self):
+        return {
+            "id": "2594", "consumer_id": "83", "reading_date": "2026-11-21",
+            "previous_reading": "993.00", "present_reading": "8.00",
+            "consumption": "47.00", "reading_source": "incident",
+            "carried_consumption": "39.00", "prior_usage_basis": "three_month_average",
+            "new_baseline": "0.00", "meter_incident_id": "47",
+            "idempotency_key": "incident-2594", "created_at": "2026-11-21T00:00:00+00:00",
+            "updated_at": "2026-11-21T00:00:00+00:00",
+        }
+
+    def test_extraction_range_check_accepts_incident_reset(self):
+        row = self.incident_row()
+        columns = S.TABLE_CONTRACT["consumption"]["columns"]
+        values = [row.get(column) for column in columns]
+        result = S.validate_rows("consumption", columns, [values], source_count=1)
+        self.assertEqual(result["status"], "PASS")
+
+    def test_transform_preserves_valid_incident_provenance(self):
+        context = T.Context("transform-test", "extract-test", "2026-11-21")
+        output = T.build_fact_consumption(
+            [self.incident_row()], {83}, {2594: (2026, 11)}, context)
+
+        self.assertEqual(len(output), 1)
+        self.assertEqual(context.quarantine, [])
+        self.assertEqual(output[0]["reading_source"], "incident")
+        self.assertEqual(output[0]["carried_consumption"], "39.00")
+        self.assertEqual(output[0]["new_baseline"], "0.00")
+        self.assertEqual(output[0]["meter_incident_id"], 47)
+        self.assertEqual(output[0]["consumption"], "47.00")
+
+    def test_unexplained_reading_drop_is_still_rejected(self):
+        row = self.incident_row()
+        row.update({"reading_source": "actual", "carried_consumption": "0",
+                    "prior_usage_basis": "", "new_baseline": "",
+                    "meter_incident_id": ""})
+        context = T.Context("transform-test", "extract-test", "2026-11-21")
+
+        output = T.build_fact_consumption([row], {83}, {2594: (2026, 11)}, context)
+
+        self.assertEqual(output, [])
+        self.assertEqual(len(context.quarantine), 1)
+        self.assertIn("present_reading", context.quarantine[0]["rejection_reason"])
+
+    def test_inactive_consumer_exclusion_counter_matches_output(self):
+        context = T.Context("transform-test", "extract-test", "2026-11-21")
+        row = {
+            "id": "83", "username": "inactive-user", "first_name": "Test",
+            "middle_name": "", "last_name": "Consumer", "email": "test@example.com",
+            "contact_number": "", "purok_no": "1", "status": "inactive",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+
+        output = T.build_dim_consumer([row], context)
+
+        self.assertEqual(output[0]["active_flag"], "FALSE")
+        self.assertEqual(context.exclusions["X-01"], 1)
+
+
 # ---------------------------------------------------------------------------
 # Warehouse tests (never commit)
 # ---------------------------------------------------------------------------
@@ -266,7 +384,8 @@ class WarehouseTests(unittest.TestCase):
                 "--transformed-root", str(TMP / "transformed"),
                 "--transformation-log-root", str(TMP / "tlogs"),
                 "--log-root", str(self.out / "logs"),
-                "--quarantine-root", str(self.out / "quarantine"), *extra]
+                "--quarantine-root", str(self.out / "quarantine"),
+                "--loaded-root", str(self.out / "loaded"), *extra]
         patches = [mock.patch.object(L, "read_handover", lambda *a, **k: handover_override)] \
             if handover_override else []
         with contextlib.ExitStack() as stack:
@@ -328,6 +447,8 @@ class WarehouseTests(unittest.TestCase):
         self.assertEqual(snapshot["data_rows"], sum(t.row_count
                                                     for t in handover().tables.values()))
         self.assertEqual([row[1] for row in snapshot["log"]], ["SUCCESS"] * 5)
+        self.assertEqual(len(list((self.out / "loaded").rglob("*.csv"))),
+                         len(L.LOAD_ORDER))
 
     def test_dry_run_writes_nothing(self):
         rc = self.run_main("--dry-run")
