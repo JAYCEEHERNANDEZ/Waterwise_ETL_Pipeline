@@ -10,11 +10,11 @@ Implements docs/extraction.md:
 
 Usage:
     # Full load
-    python -m pipeline.stage --full --run-id ww-extract-local-001
+    python -m pipeline.extract --full --run-id ww-extract-local-001
     # Incremental (explicit window, ISO timestamps)
-    python -m pipeline.stage --window-start 2026-03-09T01:00:00+08:00 --window-end 2026-03-10T01:00:00+08:00
+    python -m pipeline.extract --window-start 2026-03-09T01:00:00+08:00 --window-end 2026-03-10T01:00:00+08:00
     # Dry run (no DB needed, validates contract + synthetic validation logic)
-    python -m pipeline.stage --dry-run
+    python -m pipeline.extract --dry-run
 
 Connection (service-role, server-side only, never frontend):
     Set one of (first match wins):
@@ -82,6 +82,8 @@ TABLE_CONTRACT: dict[str, dict[str, Any]] = {
         "columns": [
             "id", "consumer_id", "reading_date",
             "previous_reading", "present_reading", "consumption",
+            "reading_source", "carried_consumption", "prior_usage_basis",
+            "new_baseline", "meter_incident_id",
             "idempotency_key", "created_at", "updated_at",
         ],
         "pk": "id",
@@ -326,7 +328,10 @@ def validate_rows(table: str, cols: list[str], rows: list[tuple], source_count: 
         if table == "consumption" and "previous_reading" in idx:
             for r in rows:
                 prev, pres, cons = r[idx["previous_reading"]], r[idx["present_reading"]], r[idx["consumption"]]
-                if pres is not None and prev is not None and float(pres) < float(prev):
+                reading_source = str(r[idx["reading_source"]] or "actual").lower()
+                if (pres is not None and prev is not None
+                        and float(pres) < float(prev)
+                        and reading_source != "incident"):
                     range_flags += 1
                 elif cons is not None and float(cons) < 0:
                     range_flags += 1

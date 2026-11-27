@@ -2,5 +2,5 @@
 psycopg2-binary>=2.9
 pandas>=2.0
 python-dotenv>=1.0
-# Airflow is only needed on the orchestrator, not for local `python -m pipeline.stage` runs:
+# Airflow is only needed on the orchestrator, not for local `python -m pipeline.extract` runs:
 # apache-airflow>=2.8

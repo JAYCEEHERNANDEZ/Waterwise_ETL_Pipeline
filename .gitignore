@@ -3,6 +3,7 @@ pipeline/.env
 .env
 rawdata/
 transformed/
+loaded/
 quarantine/
 logs/
 __pycache__/
